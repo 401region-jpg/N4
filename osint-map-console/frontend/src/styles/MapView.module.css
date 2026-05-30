@@ -9,23 +9,20 @@
   height: 100%;
 }
 
-/* Override MapLibre defaults for dark theme */
+/* MapLibre dark overrides */
 .map :global(.maplibregl-ctrl-group) {
   background: var(--bg-panel2) !important;
   border: 1px solid var(--border-bright) !important;
   border-radius: 0 !important;
 }
-
 .map :global(.maplibregl-ctrl-group button) {
   background-color: transparent !important;
   border-color: var(--border) !important;
   filter: invert(0.8) !important;
 }
-
 .map :global(.maplibregl-ctrl-group button:hover) {
   background: var(--bg-hover) !important;
 }
-
 .map :global(.maplibregl-ctrl-scale) {
   background: var(--bg-panel) !important;
   border-color: var(--border-bright) !important;
@@ -33,22 +30,21 @@
   font-family: var(--font-mono) !important;
   font-size: 10px !important;
 }
-
 .map :global(.maplibregl-ctrl-attrib) {
-  background: rgba(8, 12, 16, 0.7) !important;
+  background: rgba(8,12,16,0.7) !important;
   color: var(--text-muted) !important;
   font-size: 9px !important;
 }
-
 .map :global(.maplibregl-ctrl-attrib a) {
   color: var(--accent-dim) !important;
 }
 
+/* Cursor coords — bottom-left, above scale */
 .coords {
   position: absolute;
   bottom: 36px;
   left: 12px;
-  background: rgba(8, 12, 16, 0.75);
+  background: rgba(8,12,16,0.78);
   border: 1px solid var(--border);
   padding: 3px 8px;
   font-family: var(--font-mono);
@@ -56,14 +52,16 @@
   color: var(--text-secondary);
   letter-spacing: 0.5px;
   pointer-events: none;
+  min-width: 180px;
+  min-height: 18px;
 }
 
 .hint {
   position: absolute;
-  top: 16px;
+  top: 14px;
   left: 50%;
   transform: translateX(-50%);
-  background: rgba(8, 12, 16, 0.6);
+  background: rgba(8,12,16,0.6);
   border: 1px solid var(--border);
   padding: 4px 14px;
   font-family: var(--font-mono);
