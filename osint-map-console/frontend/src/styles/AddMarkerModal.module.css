@@ -1,0 +1,236 @@
+.overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.6);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 1000;
+  backdrop-filter: blur(2px);
+  animation: fadeIn 0.1s ease-out;
+}
+
+@keyframes fadeIn {
+  from { opacity: 0; }
+  to   { opacity: 1; }
+}
+
+.modal {
+  width: 380px;
+  background: var(--bg-panel);
+  border: 1px solid var(--border-bright);
+  display: flex;
+  flex-direction: column;
+  animation: slideUp 0.15s ease-out;
+  box-shadow: 0 0 40px rgba(0, 229, 255, 0.08), 0 20px 60px rgba(0, 0, 0, 0.6);
+}
+
+@keyframes slideUp {
+  from { transform: translateY(12px); opacity: 0; }
+  to   { transform: translateY(0);    opacity: 1; }
+}
+
+.header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 12px 16px;
+  border-bottom: 1px solid var(--border);
+  background: var(--bg-panel2);
+}
+
+.headerIcon {
+  color: var(--accent);
+  font-size: 14px;
+}
+
+.headerLabel {
+  flex: 1;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  letter-spacing: 3px;
+  color: var(--accent);
+}
+
+.closeBtn {
+  background: transparent;
+  border: none;
+  color: var(--text-muted);
+  font-size: 11px;
+  padding: 2px 6px;
+  transition: color 0.15s;
+}
+
+.closeBtn:hover { color: var(--red); }
+
+.coordsDisplay {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 16px;
+  background: var(--bg-base);
+  border-bottom: 1px solid var(--border);
+}
+
+.coordPair {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.coordKey {
+  font-family: var(--font-mono);
+  font-size: 9px;
+  letter-spacing: 1px;
+  color: var(--accent-dim);
+}
+
+.coordVal {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--text-secondary);
+}
+
+.coordSep {
+  color: var(--border-bright);
+}
+
+.body {
+  padding: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.formGroup {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.label {
+  font-family: var(--font-mono);
+  font-size: 9px;
+  letter-spacing: 2px;
+  color: var(--text-muted);
+}
+
+.required {
+  color: var(--red);
+}
+
+.input {
+  background: var(--bg-base);
+  border: 1px solid var(--border-bright);
+  color: var(--text-primary);
+  padding: 8px 10px;
+  font-size: 13px;
+  outline: none;
+  transition: border-color 0.15s;
+  letter-spacing: 0.5px;
+}
+
+.input:focus {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 1px var(--accent-dim);
+}
+
+.input::placeholder { color: var(--text-muted); }
+
+.textarea {
+  background: var(--bg-base);
+  border: 1px solid var(--border-bright);
+  color: var(--text-primary);
+  padding: 8px 10px;
+  font-size: 12px;
+  outline: none;
+  resize: vertical;
+  min-height: 60px;
+  line-height: 1.5;
+  transition: border-color 0.15s;
+}
+
+.textarea:focus {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 1px var(--accent-dim);
+}
+
+.textarea::placeholder { color: var(--text-muted); }
+
+.colorRow {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.colorBtn {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  padding: 5px 9px;
+  border: 1px solid;
+  transition: all 0.15s;
+}
+
+.colorBtn:hover {
+  background: rgba(255,255,255,0.05) !important;
+}
+
+.colorDot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+
+.colorLabel {
+  font-family: var(--font-mono);
+  font-size: 9px;
+  letter-spacing: 1px;
+  transition: color 0.15s;
+}
+
+.footer {
+  display: flex;
+  gap: 0;
+  border-top: 1px solid var(--border);
+}
+
+.cancelBtn {
+  flex: 1;
+  padding: 12px;
+  background: transparent;
+  border: none;
+  border-right: 1px solid var(--border);
+  color: var(--text-muted);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  letter-spacing: 2px;
+  transition: background 0.15s, color 0.15s;
+}
+
+.cancelBtn:hover {
+  background: var(--bg-hover);
+  color: var(--text-primary);
+}
+
+.confirmBtn {
+  flex: 2;
+  padding: 12px;
+  background: var(--accent-glow);
+  border: none;
+  color: var(--accent);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  letter-spacing: 2px;
+  transition: background 0.15s, opacity 0.15s;
+}
+
+.confirmBtn:hover:not(:disabled) {
+  background: rgba(0, 229, 255, 0.2);
+}
+
+.confirmBtn:disabled {
+  opacity: 0.3;
+  cursor: not-allowed;
+}

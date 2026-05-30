@@ -1,0 +1,58 @@
+@import url('https://fonts.googleapis.com/css2?family=Share+Tech+Mono&family=Rajdhani:wght@400;500;600;700&display=swap');
+
+:root {
+  --bg-base: #080c10;
+  --bg-panel: #0d1218;
+  --bg-panel2: #111820;
+  --bg-hover: #1a2430;
+  --border: #1e2d3d;
+  --border-bright: #2a4060;
+  --accent: #00e5ff;
+  --accent-dim: #007a99;
+  --accent-glow: rgba(0, 229, 255, 0.15);
+  --green: #00ff88;
+  --green-dim: #00994d;
+  --red: #ff3b5c;
+  --yellow: #ffcc00;
+  --text-primary: #c8dae8;
+  --text-secondary: #5a7a94;
+  --text-muted: #304050;
+  --font-mono: 'Share Tech Mono', monospace;
+  --font-ui: 'Rajdhani', sans-serif;
+}
+
+*, *::before, *::after {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+html, body, #root {
+  width: 100%;
+  height: 100%;
+  overflow: hidden;
+  background: var(--bg-base);
+  color: var(--text-primary);
+  font-family: var(--font-ui);
+  font-size: 14px;
+}
+
+::-webkit-scrollbar {
+  width: 4px;
+}
+::-webkit-scrollbar-track {
+  background: var(--bg-panel);
+}
+::-webkit-scrollbar-thumb {
+  background: var(--border-bright);
+  border-radius: 2px;
+}
+
+button {
+  font-family: var(--font-ui);
+  cursor: pointer;
+}
+
+input, textarea {
+  font-family: var(--font-mono);
+}
