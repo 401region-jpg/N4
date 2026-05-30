@@ -5,15 +5,13 @@ function formatTimestamp(ts) {
   return d.toISOString().replace('T', ' ').slice(0, 19) + ' UTC'
 }
 
-export default function MarkerPanel({ marker, onClose, onDelete, onLocate }) {
+export default function MarkerPanel({ marker, onClose, onDelete, onLocate, onEdit }) {
   return (
     <div className={styles.panel}>
       <div className={styles.header}>
         <div className={styles.headerLeft}>
-          <span
-            className={styles.colorDot}
-            style={{ background: marker.color, boxShadow: `0 0 8px ${marker.color}` }}
-          />
+          <span className={styles.colorDot}
+            style={{ background: marker.color, boxShadow: `0 0 8px ${marker.color}` }} />
           <span className={styles.headerLabel}>OBJECT</span>
           <span className={styles.headerId}>#{String(marker.id).padStart(4, '0')}</span>
         </div>
@@ -24,13 +22,6 @@ export default function MarkerPanel({ marker, onClose, onDelete, onLocate }) {
         <div className={styles.field}>
           <span className={styles.fieldLabel}>TITLE</span>
           <span className={styles.fieldValue}>{marker.title}</span>
-        </div>
-
-        <div className={styles.field}>
-          <span className={styles.fieldLabel}>COORDINATES</span>
-          <span className={styles.fieldValueMono}>
-            {marker.lat.toFixed(6)}, {marker.lng.toFixed(6)}
-          </span>
         </div>
 
         <div className={styles.field}>
@@ -71,10 +62,10 @@ export default function MarkerPanel({ marker, onClose, onDelete, onLocate }) {
         <button className={styles.actionBtn} onClick={() => onLocate(marker)}>
           <span>◎</span> LOCATE
         </button>
-        <button
-          className={`${styles.actionBtn} ${styles.actionDanger}`}
-          onClick={() => onDelete(marker.id)}
-        >
+        <button className={styles.actionBtn} onClick={() => onEdit(marker)}>
+          <span>✎</span> EDIT
+        </button>
+        <button className={`${styles.actionBtn} ${styles.actionDanger}`} onClick={() => onDelete(marker.id)}>
           <span>✕</span> DELETE
         </button>
       </div>
