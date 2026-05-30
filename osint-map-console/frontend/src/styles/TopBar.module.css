@@ -188,3 +188,26 @@
   color: var(--text-secondary);
   letter-spacing: 1px;
 }
+
+.ioButtons {
+  display: flex;
+  gap: 2px;
+}
+
+.ioBtn {
+  background: transparent;
+  border: 1px solid var(--border);
+  color: var(--text-secondary);
+  padding: 4px 10px;
+  font-size: 10px;
+  font-family: var(--font-mono);
+  letter-spacing: 1px;
+  height: 28px;
+  transition: all 0.15s;
+  white-space: nowrap;
+}
+
+.ioBtn:hover {
+  border-color: var(--green-dim);
+  color: var(--green);
+}
