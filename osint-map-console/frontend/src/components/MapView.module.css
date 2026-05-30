@@ -74,6 +74,12 @@
   letter-spacing: 0.5px;
   min-width: 200px;
   display: inline-block;
+  pointer-events: auto;
+  cursor: pointer;
+}
+.coords:hover {
+  border-color: rgba(0, 229, 255, 0.5);
+  color: rgba(0, 229, 255, 0.95);
 }
 
 .zoom {

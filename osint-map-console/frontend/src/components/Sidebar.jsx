@@ -1,12 +1,12 @@
 import styles from '../styles/Sidebar.module.css'
 
-// Countries, Regions, Cities, Grid are implemented.
-// Routes, Zones remain disabled.
+// Countries, Cities, Grid are implemented.
+// Regions needs a global admin-1 vector source we don't have keyless; Routes/Zones land in Stage 2.
 const OVERLAY_LAYERS = [
   { key: 'countries', label: 'COUNTRIES', icon: '◫', impl: true },
-  { key: 'regions',   label: 'REGIONS',   icon: '⊟', impl: true },
   { key: 'cities',    label: 'CITIES',    icon: '⊙', impl: true },
   { key: 'grid',      label: 'GRID',      icon: '⊞', impl: true },
+  { key: 'regions',   label: 'REGIONS',   icon: '⊟', impl: false },
   { key: 'routes',    label: 'ROUTES',    icon: '⇒', impl: false },
   { key: 'zones',     label: 'ZONES',     icon: '◻', impl: false },
 ]

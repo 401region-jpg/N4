@@ -14,7 +14,6 @@ import styles from './styles/App.module.css'
 
 const INIT_OVERLAY = {
   countries: true,
-  regions:   false,
   cities:    false,
   grid:      false,
 }
@@ -206,6 +205,7 @@ export default function App() {
             measureActive={measureActive}
             onMeasureResult={handleMeasureResult}
             coordFormat={coordFormat}
+            onCopyCoords={handleCopyCoords}
           />
         </div>
 

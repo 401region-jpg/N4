@@ -9,7 +9,7 @@ import {
   DEFAULT_BASEMAP,
 } from '../hooks/basemaps.js'
 import { attachGridCanvas, haversineMeters, formatDistance } from '../hooks/gridLayer.js'
-import styles from '../styles/MapView.module.css'
+import styles from './MapView.module.css'
 
 const DEFAULT_CENTER = [0, 20]
 const DEFAULT_ZOOM   = 2.5
@@ -40,6 +40,7 @@ export default function MapView({
   measureActive,        // bool — measure mode on/off
   onMeasureResult,      // (distanceStr | null) => void
   coordFormat,          // 'decimal' | 'dms'
+  onCopyCoords,         // (lat, lng) => void — copy cursor coords
 }) {
   const containerRef   = useRef(null)
   const gridCanvasRef  = useRef(null)
@@ -49,6 +50,9 @@ export default function MapView({
   const gridCleanupRef = useRef(null)
   const coordsRef      = useRef(null)
   const zoomRef        = useRef(null)
+  const lastLngLatRef  = useRef(null)
+  const onCopyCoordsRef = useRef(onCopyCoords)
+  onCopyCoordsRef.current = onCopyCoords
 
   // Measure state (lives in refs to avoid re-render on every mousemove)
   const measureRef = useRef({ active: false, pointA: null, line: null, popup: null })
@@ -155,6 +159,7 @@ export default function MapView({
 
     // Coords display + zoom display
     map.on('mousemove', (e) => {
+      lastLngLatRef.current = e.lngLat
       if (!coordsRef.current) return
       const { lat, lng } = e.lngLat
       if (coordFmtRef.current === 'dms') {
@@ -379,11 +384,19 @@ export default function MapView({
 
       {/* HUD bottom-left */}
       <div className={styles.hud}>
-        <span ref={coordsRef} className={styles.coords} />
+        <span
+          ref={coordsRef}
+          className={styles.coords}
+          title="Click to copy cursor coordinates"
+          onClick={() => {
+            const ll = lastLngLatRef.current || mapRef.current?.getCenter()
+            if (ll && onCopyCoordsRef.current) onCopyCoordsRef.current(ll.lat, ll.lng)
+          }}
+        />
         <span ref={zoomRef}   className={styles.zoom} />
       </div>
 
-      <div className={styles.hint}>◈ CLICK TO PLACE MARKER</div>
+      <div className={styles.hint}>◈ CLICK MAP TO PLACE MARKER · CLICK COORDS TO COPY</div>
 
       <style>{`
         @keyframes osint-pulse {
