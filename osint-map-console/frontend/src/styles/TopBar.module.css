@@ -6,9 +6,10 @@
   padding: 0 12px;
   background: var(--bg-panel);
   border-bottom: 1px solid var(--border);
-  z-index: 100;
+  position: relative;
+  z-index: 1000;
   flex-shrink: 0;
-  overflow: hidden;
+  /* No overflow:hidden — it clipped the search dropdown, which hangs below the bar. */
 }
 
 .logo {
@@ -70,9 +71,10 @@
   background: var(--bg-panel2);
   border: 1px solid var(--border-bright);
   list-style: none;
-  z-index: 999;
+  z-index: 1500;
   max-height: 240px;
   overflow-y: auto;
+  box-shadow: 0 6px 18px rgba(0, 0, 0, 0.55);
 }
 .dropdownItem {
   display: flex;
