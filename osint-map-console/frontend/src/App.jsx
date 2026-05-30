@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from 'react'
+import { useState, useEffect, useCallback, useRef } from 'react'
 import MapView from './components/MapView.jsx'
 import Sidebar from './components/Sidebar.jsx'
 import TopBar from './components/TopBar.jsx'
@@ -13,40 +13,56 @@ import { DEFAULT_BASEMAP } from './hooks/basemaps.js'
 import styles from './styles/App.module.css'
 
 export default function App() {
-  const [markers, setMarkers] = useState([])
+  const [markers,       setMarkers]       = useState([])
   const [selectedMarker, setSelectedMarker] = useState(null)
-  const [basemap, setBasemap] = useState(DEFAULT_BASEMAP)
+  const [basemap,       setBasemap]       = useState(DEFAULT_BASEMAP)
   const [markersVisible, setMarkersVisible] = useState(true)
-  const [pendingCoords, setPendingCoords] = useState(null)  // add mode
-  const [editingMarker, setEditingMarker] = useState(null)  // edit mode
-  const [backendOk, setBackendOk] = useState(null)
-  const [flyTo, setFlyTo] = useState(null)
-  const [toast, setToast] = useState(null)  // { msg, type }
+  const [pendingCoords, setPendingCoords] = useState(null)
+  const [editingMarker, setEditingMarker] = useState(null)
+  const [backendOk,     setBackendOk]     = useState(null)
+  const [flyTo,         setFlyTo]         = useState(null)
+  const [fitAllTrigger, setFitAllTrigger] = useState(0)
+  const [toasts,        setToasts]        = useState([])  // [{id, msg, type}]
+  const toastIdRef = useRef(0)
 
+  // ── Toast helpers ──────────────────────────────────────────────────────────
   const showToast = useCallback((msg, type = 'error') => {
-    setToast({ msg, type })
+    setToasts((prev) => {
+      // Deduplicate: don't stack identical message
+      if (prev.length && prev[prev.length - 1].msg === msg) return prev
+      const id = ++toastIdRef.current
+      return [...prev, { id, msg, type }]
+    })
   }, [])
 
+  const dismissToast = useCallback((id) => {
+    setToasts((prev) => prev.filter((t) => t.id !== id))
+  }, [])
+
+  // ── Init ───────────────────────────────────────────────────────────────────
   useEffect(() => {
     checkHealth().then((ok) => {
       setBackendOk(ok)
       if (ok) {
-        fetchMarkers().then(setMarkers).catch(() => showToast('Failed to load markers'))
+        fetchMarkers()
+          .then(setMarkers)
+          .catch(() => showToast('Failed to load markers'))
+      } else {
+        showToast('Backend offline — check uvicorn is running')
       }
     })
   }, []) // eslint-disable-line
 
-  const handleMapClick = useCallback((coords) => {
-    setPendingCoords(coords)
-  }, [])
-
-  // ── Add ────────────────────────────────────────────────────────────────────
+  // ── Add marker ─────────────────────────────────────────────────────────────
   const handleAddMarker = useCallback(async ({ title, note, color }) => {
     if (!pendingCoords) return
     try {
-      const m = await createMarker({ lat: pendingCoords.lat, lng: pendingCoords.lng, title, note, color })
+      const m = await createMarker({
+        lat: pendingCoords.lat, lng: pendingCoords.lng, title, note, color,
+      })
       setMarkers((prev) => [m, ...prev])
       setSelectedMarker(m)
+      showToast(`Marker "${m.title}" saved`, 'success')
     } catch (e) {
       showToast(e.message)
     } finally {
@@ -54,13 +70,14 @@ export default function App() {
     }
   }, [pendingCoords, showToast])
 
-  // ── Edit ───────────────────────────────────────────────────────────────────
+  // ── Edit marker ────────────────────────────────────────────────────────────
   const handleEditMarker = useCallback(async ({ title, note, color }) => {
     if (!editingMarker) return
     try {
       const updated = await updateMarker(editingMarker.id, { title, note, color })
       setMarkers((prev) => prev.map((m) => m.id === updated.id ? updated : m))
       setSelectedMarker(updated)
+      showToast(`"${updated.title}" updated`, 'success')
     } catch (e) {
       showToast(e.message)
     } finally {
@@ -68,16 +85,18 @@ export default function App() {
     }
   }, [editingMarker, showToast])
 
-  // ── Delete ─────────────────────────────────────────────────────────────────
+  // ── Delete marker ──────────────────────────────────────────────────────────
   const handleDeleteMarker = useCallback(async (id) => {
+    const m = markers.find((x) => x.id === id)
     try {
       await deleteMarker(id)
-      setMarkers((prev) => prev.filter((m) => m.id !== id))
+      setMarkers((prev) => prev.filter((x) => x.id !== id))
       setSelectedMarker((prev) => prev?.id === id ? null : prev)
+      if (m) showToast(`"${m.title}" deleted`, 'success')
     } catch (e) {
       showToast(e.message)
     }
-  }, [showToast])
+  }, [markers, showToast])
 
   // ── Export ─────────────────────────────────────────────────────────────────
   const handleExport = useCallback(async () => {
@@ -89,20 +108,33 @@ export default function App() {
       a.download = 'markers.geojson'
       a.click()
       URL.revokeObjectURL(url)
+      showToast(`Exported ${markers.length} markers`, 'success')
     } catch (e) {
       showToast(e.message)
     }
-  }, [showToast])
+  }, [markers.length, showToast])
 
   // ── Import ─────────────────────────────────────────────────────────────────
   const handleImport = useCallback(async (file) => {
+    if (!file) return
+    let geojson
     try {
       const text = await file.text()
-      const geojson = JSON.parse(text)
+      if (!text.trim()) throw new Error('File is empty')
+      geojson = JSON.parse(text)
+    } catch (e) {
+      showToast(`Invalid file: ${e.message}`)
+      return
+    }
+    try {
       const result = await importGeoJSON(geojson)
-      const fresh = await fetchMarkers()
+      const fresh  = await fetchMarkers()
       setMarkers(fresh)
-      showToast(`Imported ${result.imported} markers${result.skipped ? `, skipped ${result.skipped}` : ''}`, 'info')
+      showToast(
+        `Imported ${result.imported} marker${result.imported !== 1 ? 's' : ''}` +
+        (result.skipped ? ` (${result.skipped} skipped)` : ''),
+        'success'
+      )
     } catch (e) {
       showToast(e.message || 'Import failed')
     }
@@ -111,6 +143,14 @@ export default function App() {
   const handleLocateMarker = useCallback((marker) => {
     setFlyTo({ lat: marker.lat, lng: marker.lng, zoom: 14 })
     setSelectedMarker(marker)
+  }, [])
+
+  const handleFitAll = useCallback(() => {
+    setFitAllTrigger((n) => n + 1)
+  }, [])
+
+  const handleResetView = useCallback(() => {
+    setFlyTo({ lat: 20, lng: 0, zoom: 2.5 })
   }, [])
 
   return (
@@ -122,6 +162,7 @@ export default function App() {
         onSearch={setFlyTo}
         onExport={handleExport}
         onImport={handleImport}
+        onResetView={handleResetView}
       />
 
       <div className={styles.workspace}>
@@ -132,6 +173,7 @@ export default function App() {
           onDeleteMarker={handleDeleteMarker}
           markersVisible={markersVisible}
           onToggleMarkers={() => setMarkersVisible((v) => !v)}
+          onFitAll={handleFitAll}
         />
 
         <div className={styles.mapContainer}>
@@ -140,10 +182,11 @@ export default function App() {
             markers={markers}
             markersVisible={markersVisible}
             selectedMarker={selectedMarker}
-            onMapClick={handleMapClick}
+            onMapClick={setPendingCoords}
             onMarkerClick={setSelectedMarker}
             flyTo={flyTo}
             onFlyToDone={() => setFlyTo(null)}
+            fitAllTrigger={fitAllTrigger}
           />
         </div>
 
@@ -158,7 +201,6 @@ export default function App() {
         )}
       </div>
 
-      {/* Add modal */}
       {pendingCoords && (
         <MarkerModal
           mode="add"
@@ -168,7 +210,6 @@ export default function App() {
         />
       )}
 
-      {/* Edit modal */}
       {editingMarker && (
         <MarkerModal
           mode="edit"
@@ -178,7 +219,11 @@ export default function App() {
         />
       )}
 
-      {toast && <Toast msg={toast.msg} type={toast.type} onDone={() => setToast(null)} />}
+      <div className={styles.toastStack}>
+        {toasts.map((t) => (
+          <Toast key={t.id} msg={t.msg} type={t.type} onDone={() => dismissToast(t.id)} />
+        ))}
+      </div>
     </div>
   )
 }
