@@ -4,28 +4,38 @@ import styles from '../styles/TopBar.module.css'
 
 const NOMINATIM = 'https://nominatim.openstreetmap.org/search'
 
-export default function TopBar({ basemap, onBasemapChange, backendOk, onSearch, onExport, onImport }) {
-  const [query, setQuery] = useState('')
-  const [results, setResults] = useState([])
+export default function TopBar({
+  basemap, onBasemapChange, backendOk,
+  onSearch, onExport, onImport, onResetView,
+}) {
+  const [query,     setQuery]     = useState('')
+  const [results,   setResults]   = useState([])
   const [searching, setSearching] = useState(false)
-  const debounceRef = useRef(null)
+  const [noResults, setNoResults] = useState(false)
+  const debounceRef  = useRef(null)
   const fileInputRef = useRef(null)
 
   const handleQueryChange = (e) => {
     const val = e.target.value
     setQuery(val)
+    setNoResults(false)
     clearTimeout(debounceRef.current)
     if (val.length < 3) { setResults([]); return }
     debounceRef.current = setTimeout(async () => {
       setSearching(true)
       try {
-        const res = await fetch(
-          `${NOMINATIM}?q=${encodeURIComponent(val)}&format=json&limit=5&accept-language=ru,en`
+        const res  = await fetch(
+          `${NOMINATIM}?q=${encodeURIComponent(val)}&format=json&limit=6&accept-language=ru,en`
         )
         const data = await res.json()
         setResults(data)
-      } catch { setResults([]) }
-      finally { setSearching(false) }
+        setNoResults(data.length === 0)
+      } catch {
+        setResults([])
+        setNoResults(false)
+      } finally {
+        setSearching(false)
+      }
     }, 400)
   }
 
@@ -33,9 +43,10 @@ export default function TopBar({ basemap, onBasemapChange, backendOk, onSearch, 
     onSearch({ lat: parseFloat(r.lat), lng: parseFloat(r.lon), zoom: 13 })
     setQuery(r.display_name.split(',')[0])
     setResults([])
+    setNoResults(false)
   }
 
-  const handleImportClick = () => fileInputRef.current?.click()
+  const closeDropdown = () => { setResults([]); setNoResults(false) }
 
   const handleFileChange = (e) => {
     const file = e.target.files?.[0]
@@ -50,6 +61,7 @@ export default function TopBar({ basemap, onBasemapChange, backendOk, onSearch, 
         <span className={styles.logoText}>OSINT<span className={styles.logoSub}>MAP</span></span>
       </div>
 
+      {/* Search */}
       <div className={styles.searchWrapper}>
         <div className={styles.searchBox}>
           <span className={styles.searchIcon}>⌕</span>
@@ -58,13 +70,16 @@ export default function TopBar({ basemap, onBasemapChange, backendOk, onSearch, 
             placeholder="SEARCH LOCATION..."
             value={query}
             onChange={handleQueryChange}
-            onKeyDown={(e) => e.key === 'Escape' && setResults([])}
+            onKeyDown={(e) => e.key === 'Escape' && closeDropdown()}
           />
           {searching && <span className={styles.spinner}>◌</span>}
         </div>
-        {results.length > 0 && (
+
+        {(results.length > 0 || noResults) && (
           <ul className={styles.dropdown}>
-            {results.map((r) => (
+            {noResults ? (
+              <li className={styles.dropdownEmpty}>Nothing found</li>
+            ) : results.map((r) => (
               <li key={r.place_id} className={styles.dropdownItem} onClick={() => handleSelect(r)}>
                 <span className={styles.dropdownName}>{r.display_name.split(',').slice(0, 2).join(', ')}</span>
                 <span className={styles.dropdownType}>{r.type?.toUpperCase()}</span>
@@ -74,6 +89,7 @@ export default function TopBar({ basemap, onBasemapChange, backendOk, onSearch, 
         )}
       </div>
 
+      {/* Basemap */}
       <div className={styles.basemapSwitcher}>
         {Object.values(BASEMAPS).map((bm) => (
           <button
@@ -86,11 +102,17 @@ export default function TopBar({ basemap, onBasemapChange, backendOk, onSearch, 
         ))}
       </div>
 
+      {/* Reset view */}
+      <button className={styles.iconBtn} onClick={onResetView} title="Reset view to world">
+        ⊕
+      </button>
+
+      {/* IO */}
       <div className={styles.ioButtons}>
-        <button className={styles.ioBtn} onClick={onExport} title="Export all markers as GeoJSON">
+        <button className={styles.ioBtn} onClick={onExport} title="Export markers as GeoJSON">
           ↓ EXPORT
         </button>
-        <button className={styles.ioBtn} onClick={handleImportClick} title="Import markers from GeoJSON file">
+        <button className={styles.ioBtn} onClick={() => fileInputRef.current?.click()} title="Import GeoJSON">
           ↑ IMPORT
         </button>
         <input
@@ -102,8 +124,11 @@ export default function TopBar({ basemap, onBasemapChange, backendOk, onSearch, 
         />
       </div>
 
+      {/* Status */}
       <div className={styles.status}>
-        <span className={`${styles.statusDot} ${backendOk === null ? styles.pending : backendOk ? styles.online : styles.offline}`} />
+        <span className={`${styles.statusDot} ${
+          backendOk === null ? styles.pending : backendOk ? styles.online : styles.offline
+        }`} />
         <span className={styles.statusText}>
           {backendOk === null ? 'CONNECTING' : backendOk ? 'API ONLINE' : 'API OFFLINE'}
         </span>
