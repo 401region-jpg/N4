@@ -19,3 +19,18 @@
   position: relative;
   overflow: hidden;
 }
+
+.toastStack {
+  position: fixed;
+  bottom: 20px;
+  right: 20px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  z-index: 2000;
+  pointer-events: none;
+}
+
+.toastStack > * {
+  pointer-events: all;
+}
