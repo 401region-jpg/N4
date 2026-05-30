@@ -4,11 +4,12 @@ import styles from '../styles/TopBar.module.css'
 
 const NOMINATIM = 'https://nominatim.openstreetmap.org/search'
 
-export default function TopBar({ basemap, onBasemapChange, backendOk, onSearch }) {
+export default function TopBar({ basemap, onBasemapChange, backendOk, onSearch, onExport, onImport }) {
   const [query, setQuery] = useState('')
   const [results, setResults] = useState([])
   const [searching, setSearching] = useState(false)
   const debounceRef = useRef(null)
+  const fileInputRef = useRef(null)
 
   const handleQueryChange = (e) => {
     const val = e.target.value
@@ -19,8 +20,7 @@ export default function TopBar({ basemap, onBasemapChange, backendOk, onSearch }
       setSearching(true)
       try {
         const res = await fetch(
-          `${NOMINATIM}?q=${encodeURIComponent(val)}&format=json&limit=5`,
-          { headers: { 'Accept-Language': 'en' } }
+          `${NOMINATIM}?q=${encodeURIComponent(val)}&format=json&limit=5&accept-language=ru,en`
         )
         const data = await res.json()
         setResults(data)
@@ -33,6 +33,14 @@ export default function TopBar({ basemap, onBasemapChange, backendOk, onSearch }
     onSearch({ lat: parseFloat(r.lat), lng: parseFloat(r.lon), zoom: 13 })
     setQuery(r.display_name.split(',')[0])
     setResults([])
+  }
+
+  const handleImportClick = () => fileInputRef.current?.click()
+
+  const handleFileChange = (e) => {
+    const file = e.target.files?.[0]
+    if (file) onImport(file)
+    e.target.value = ''
   }
 
   return (
@@ -76,6 +84,22 @@ export default function TopBar({ basemap, onBasemapChange, backendOk, onSearch }
             {bm.label}
           </button>
         ))}
+      </div>
+
+      <div className={styles.ioButtons}>
+        <button className={styles.ioBtn} onClick={onExport} title="Export all markers as GeoJSON">
+          ↓ EXPORT
+        </button>
+        <button className={styles.ioBtn} onClick={handleImportClick} title="Import markers from GeoJSON file">
+          ↑ IMPORT
+        </button>
+        <input
+          ref={fileInputRef}
+          type="file"
+          accept=".geojson,.json"
+          style={{ display: 'none' }}
+          onChange={handleFileChange}
+        />
       </div>
 
       <div className={styles.status}>
