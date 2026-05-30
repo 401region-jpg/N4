@@ -337,12 +337,12 @@ export default function MapView({
     })
 
     map.once('load', () => {
+      // Container can mount at zero/partial size before layout settles, which
+      // makes MapLibre paint a single degenerate world tile (the "giant centered
+      // image with black margins"). Force a resize once tiles can load.
+      map.resize()
       // Apply correct initial basemap (effect may have run before load)
       applyBasemap(map, DEFAULT_BASEMAP)
-      // Warm all basemap raster tiles once so visibility switches are instant
-      // (MapLibre skips tile fetches for hidden layers; prefetch avoids the
-      // blank/partial render that previously needed a pan/zoom to refresh).
-      prefetchBasemapTiles(map)
       // Apply initial overlay visibility
       const ov = overlayRef.current || {}
       Object.entries(OVERLAY_GROUPS).forEach(([key]) => {
@@ -383,7 +383,17 @@ export default function MapView({
 
     mapRef.current = map
 
+    // Keep the GL canvas matched to its container after any layout change
+    // (panel/sidebar toggles, window resize). Without this the map can be left
+    // at a stale size and render the degenerate world-image-with-black-margins.
+    let resizeObserver = null
+    if (typeof ResizeObserver !== 'undefined' && containerRef.current) {
+      resizeObserver = new ResizeObserver(() => map.resize())
+      resizeObserver.observe(containerRef.current)
+    }
+
     return () => {
+      if (resizeObserver) resizeObserver.disconnect()
       if (gridCleanupRef.current) gridCleanupRef.current()
       clearMarkers()
       if (searchPinRef.current) searchPinRef.current.remove()
