@@ -167,3 +167,25 @@
   color: var(--red) !important;
   background: rgba(255, 59, 92, 0.08) !important;
 }
+
+.fieldLabelRow {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 0;
+}
+
+.copyBtn {
+  background: transparent;
+  border: 1px solid var(--border);
+  color: var(--text-muted);
+  font-family: var(--font-mono);
+  font-size: 9px;
+  letter-spacing: 1px;
+  padding: 1px 6px;
+  transition: all 0.12s;
+}
+.copyBtn:hover {
+  border-color: var(--accent-dim);
+  color: var(--accent);
+}

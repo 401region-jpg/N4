@@ -7,6 +7,9 @@ const NOMINATIM = 'https://nominatim.openstreetmap.org/search'
 export default function TopBar({
   basemap, onBasemapChange, backendOk,
   onSearch, onExport, onImport, onResetView,
+  measureActive, onToggleMeasure,
+  coordFormat, onToggleCoordFormat,
+  measureResult,
 }) {
   const [query,     setQuery]     = useState('')
   const [results,   setResults]   = useState([])
@@ -30,15 +33,8 @@ export default function TopBar({
       } catch {
         setResults([])
         setNoResults(false)
-      } finally {
-        setSearching(false)
-      }
+      } finally { setSearching(false) }
     }, 380)
-  }
-
-  const handleQueryChange = (e) => {
-    setQuery(e.target.value)
-    doSearch(e.target.value)
   }
 
   const handleSelect = (r) => {
@@ -47,8 +43,6 @@ export default function TopBar({
     setResults([])
     setNoResults(false)
   }
-
-  const closeDropdown = () => { setResults([]); setNoResults(false) }
 
   return (
     <div className={styles.topbar}>
@@ -66,8 +60,8 @@ export default function TopBar({
             className={styles.searchInput}
             placeholder="SEARCH LOCATION..."
             value={query}
-            onChange={handleQueryChange}
-            onKeyDown={(e) => { if (e.key === 'Escape') closeDropdown() }}
+            onChange={(e) => { setQuery(e.target.value); doSearch(e.target.value) }}
+            onKeyDown={(e) => e.key === 'Escape' && (setResults([]), setNoResults(false))}
           />
           {searching && <span className={styles.spinner}>◌</span>}
         </div>
@@ -76,11 +70,11 @@ export default function TopBar({
             {noResults
               ? <li className={styles.dropdownEmpty}>Nothing found</li>
               : results.map((r) => (
-                  <li key={r.place_id} className={styles.dropdownItem} onClick={() => handleSelect(r)}>
-                    <span className={styles.dropdownName}>{r.display_name.split(',').slice(0, 2).join(', ')}</span>
-                    <span className={styles.dropdownType}>{r.type?.toUpperCase()}</span>
-                  </li>
-                ))
+                <li key={r.place_id} className={styles.dropdownItem} onClick={() => handleSelect(r)}>
+                  <span className={styles.dropdownName}>{r.display_name.split(',').slice(0, 2).join(', ')}</span>
+                  <span className={styles.dropdownType}>{r.type?.toUpperCase()}</span>
+                </li>
+              ))
             }
           </ul>
         )}
@@ -89,32 +83,52 @@ export default function TopBar({
       {/* Basemap */}
       <div className={styles.basemapSwitcher}>
         {BASEMAP_IDS.map((id) => (
-          <button
-            key={id}
+          <button key={id}
             className={`${styles.bmBtn} ${basemap === id ? styles.bmActive : ''}`}
-            onClick={() => onBasemapChange(id)}
-          >
+            onClick={() => onBasemapChange(id)}>
             {BASEMAP_LABELS[id]}
           </button>
         ))}
       </div>
 
-      {/* Reset view */}
-      <button className={styles.iconBtn} onClick={onResetView} title="Reset view">⊕</button>
+      {/* Tools row */}
+      <div className={styles.tools}>
+        <button className={styles.iconBtn} onClick={onResetView} title="Reset view to world">⊕</button>
+
+        <button
+          className={`${styles.toolBtn} ${measureActive ? styles.toolActive : ''}`}
+          onClick={onToggleMeasure}
+          title={measureActive ? 'Cancel measure (click 2 points)' : 'Measure distance'}>
+          ⇹ MEASURE
+        </button>
+
+        {measureActive && measureResult && (
+          <span className={styles.measureResult}>{measureResult}</span>
+        )}
+
+        <button
+          className={styles.toolBtn}
+          onClick={onToggleCoordFormat}
+          title="Toggle decimal / DMS">
+          {coordFormat === 'dms' ? 'DMS' : 'DEC'}
+        </button>
+      </div>
 
       {/* IO */}
       <div className={styles.ioButtons}>
-        <button className={styles.ioBtn} onClick={onExport} title="Export GeoJSON">↓ EXPORT</button>
-        <button className={styles.ioBtn} onClick={() => fileInputRef.current?.click()} title="Import GeoJSON">↑ IMPORT</button>
+        <button className={styles.ioBtn} onClick={onExport}>↓ EXPORT</button>
+        <button className={styles.ioBtn} onClick={() => fileInputRef.current?.click()}>↑ IMPORT</button>
         <input ref={fileInputRef} type="file" accept=".geojson,.json"
-          style={{ display: 'none' }} onChange={(e) => { const f = e.target.files?.[0]; if (f) onImport(f); e.target.value = '' }} />
+          style={{ display: 'none' }}
+          onChange={(e) => { const f = e.target.files?.[0]; if (f) onImport(f); e.target.value = '' }} />
       </div>
 
       {/* Status */}
       <div className={styles.status}>
-        <span className={`${styles.statusDot} ${backendOk === null ? styles.pending : backendOk ? styles.online : styles.offline}`} />
+        <span className={`${styles.statusDot} ${
+          backendOk === null ? styles.pending : backendOk ? styles.online : styles.offline}`} />
         <span className={styles.statusText}>
-          {backendOk === null ? 'CONNECTING' : backendOk ? 'API ONLINE' : 'API OFFLINE'}
+          {backendOk === null ? 'CONNECTING' : backendOk ? 'ONLINE' : 'OFFLINE'}
         </span>
       </div>
     </div>

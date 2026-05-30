@@ -1,11 +1,25 @@
 import styles from '../styles/MarkerPanel.module.css'
 
 function formatTimestamp(ts) {
-  const d = new Date(ts * 1000)
-  return d.toISOString().replace('T', ' ').slice(0, 19) + ' UTC'
+  return new Date(ts * 1000).toISOString().replace('T', ' ').slice(0, 19) + ' UTC'
 }
 
-export default function MarkerPanel({ marker, onClose, onDelete, onLocate, onEdit }) {
+function toDMS(deg, isLat) {
+  const abs = Math.abs(deg)
+  const d   = Math.floor(abs)
+  const mAll = (abs - d) * 60
+  const m   = Math.floor(mAll)
+  const s   = ((mAll - m) * 60).toFixed(1)
+  const dir = isLat ? (deg >= 0 ? 'N' : 'S') : (deg >= 0 ? 'E' : 'W')
+  return `${d}°${m}'${s}"${dir}`
+}
+
+export default function MarkerPanel({ marker, onClose, onDelete, onLocate, onEdit, onCopyCoords, coordFormat }) {
+  const fmt = coordFormat || 'decimal'
+
+  const latStr = fmt === 'dms' ? toDMS(marker.lat, true)  : marker.lat.toFixed(6)
+  const lngStr = fmt === 'dms' ? toDMS(marker.lng, false) : marker.lng.toFixed(6)
+
   return (
     <div className={styles.panel}>
       <div className={styles.header}>
@@ -25,15 +39,24 @@ export default function MarkerPanel({ marker, onClose, onDelete, onLocate, onEdi
         </div>
 
         <div className={styles.field}>
-          <span className={styles.fieldLabel}>LAT / LNG</span>
+          <div className={styles.fieldLabelRow}>
+            <span className={styles.fieldLabel}>COORDINATES</span>
+            {onCopyCoords && (
+              <button className={styles.copyBtn}
+                onClick={() => onCopyCoords(marker.lat, marker.lng)}
+                title="Copy coordinates">
+                ⊡ COPY
+              </button>
+            )}
+          </div>
           <div className={styles.coordRow}>
             <span className={styles.coordBox}>
               <span className={styles.coordLabel}>LAT</span>
-              <span className={styles.coordVal}>{marker.lat.toFixed(6)}</span>
+              <span className={styles.coordVal}>{latStr}</span>
             </span>
             <span className={styles.coordBox}>
               <span className={styles.coordLabel}>LNG</span>
-              <span className={styles.coordVal}>{marker.lng.toFixed(6)}</span>
+              <span className={styles.coordVal}>{lngStr}</span>
             </span>
           </div>
         </div>
@@ -59,15 +82,9 @@ export default function MarkerPanel({ marker, onClose, onDelete, onLocate, onEdi
       </div>
 
       <div className={styles.actions}>
-        <button className={styles.actionBtn} onClick={() => onLocate(marker)}>
-          <span>◎</span> LOCATE
-        </button>
-        <button className={styles.actionBtn} onClick={() => onEdit(marker)}>
-          <span>✎</span> EDIT
-        </button>
-        <button className={`${styles.actionBtn} ${styles.actionDanger}`} onClick={() => onDelete(marker.id)}>
-          <span>✕</span> DELETE
-        </button>
+        <button className={styles.actionBtn} onClick={() => onLocate(marker)}>◎ LOCATE</button>
+        <button className={styles.actionBtn} onClick={() => onEdit(marker)}>✎ EDIT</button>
+        <button className={`${styles.actionBtn} ${styles.actionDanger}`} onClick={() => onDelete(marker.id)}>✕ DELETE</button>
       </div>
     </div>
   )

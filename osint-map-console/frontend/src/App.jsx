@@ -12,8 +12,11 @@ import {
 import { DEFAULT_BASEMAP } from './hooks/basemaps.js'
 import styles from './styles/App.module.css'
 
-const DEFAULT_OVERLAY_VISIBILITY = {
+const INIT_OVERLAY = {
   countries: true,
+  regions:   false,
+  cities:    false,
+  grid:      false,
 }
 
 export default function App() {
@@ -21,15 +24,19 @@ export default function App() {
   const [selectedMarker,    setSelectedMarker]    = useState(null)
   const [basemap,           setBasemap]           = useState(DEFAULT_BASEMAP)
   const [markersVisible,    setMarkersVisible]    = useState(true)
-  const [overlayVisibility, setOverlayVisibility] = useState(DEFAULT_OVERLAY_VISIBILITY)
+  const [overlayVisibility, setOverlayVisibility] = useState(INIT_OVERLAY)
   const [pendingCoords,     setPendingCoords]     = useState(null)
   const [editingMarker,     setEditingMarker]     = useState(null)
   const [backendOk,         setBackendOk]         = useState(null)
   const [flyTo,             setFlyTo]             = useState(null)
   const [fitAllTrigger,     setFitAllTrigger]     = useState(0)
   const [searchPin,         setSearchPin]         = useState(null)
+  const [measureActive,     setMeasureActive]     = useState(false)
+  const [measureResult,     setMeasureResult]     = useState(null)
+  const [coordFormat,       setCoordFormat]       = useState('decimal') // 'decimal'|'dms'
   const [toasts,            setToasts]            = useState([])
-  const toastIdRef = useRef(0)
+  const toastIdRef   = useRef(0)
+  const searchTimerRef = useRef(null)
 
   // ── Toast ──────────────────────────────────────────────────────────────────
   const showToast = useCallback((msg, type = 'error') => {
@@ -47,11 +54,8 @@ export default function App() {
   useEffect(() => {
     checkHealth().then((ok) => {
       setBackendOk(ok)
-      if (ok) {
-        fetchMarkers().then(setMarkers).catch(() => showToast('Failed to load markers'))
-      } else {
-        showToast('Backend offline — start uvicorn on port 8000')
-      }
+      if (ok) fetchMarkers().then(setMarkers).catch(() => showToast('Failed to load markers'))
+      else    showToast('Backend offline — start uvicorn on port 8000')
     })
   }, []) // eslint-disable-line
 
@@ -95,8 +99,8 @@ export default function App() {
   const handleExport = useCallback(async () => {
     try {
       const blob = await exportGeoJSON()
-      const url = URL.createObjectURL(blob)
-      const a = document.createElement('a')
+      const url  = URL.createObjectURL(blob)
+      const a    = document.createElement('a')
       a.href = url; a.download = 'markers.geojson'; a.click()
       URL.revokeObjectURL(url)
       showToast(`Exported ${markers.length} markers`, 'success')
@@ -123,12 +127,12 @@ export default function App() {
     } catch (e) { showToast(e.message || 'Import failed') }
   }, [showToast])
 
-  // ── Search → flyTo + temp pin ─────────────────────────────────────────────
+  // ── Search ─────────────────────────────────────────────────────────────────
   const handleSearch = useCallback((loc) => {
     setFlyTo(loc)
     setSearchPin({ lat: loc.lat, lng: loc.lng })
-    // auto-clear pin after 6s
-    setTimeout(() => setSearchPin(null), 6000)
+    clearTimeout(searchTimerRef.current)
+    searchTimerRef.current = setTimeout(() => setSearchPin(null), 7000)
   }, [])
 
   const handleLocateMarker = useCallback((marker) => {
@@ -136,6 +140,25 @@ export default function App() {
     setSelectedMarker(marker)
     setSearchPin(null)
   }, [])
+
+  // ── Measure ────────────────────────────────────────────────────────────────
+  const handleMeasureResult = useCallback((distStr) => {
+    setMeasureResult(distStr)
+    if (distStr) showToast(`Distance: ${distStr}`, 'info')
+  }, [showToast])
+
+  // ── Copy center coords ─────────────────────────────────────────────────────
+  // Exposed via TopBar; MapView handles its own cursor coords
+  // This is a simpler "copy current search/fly coords" feature
+  const handleCopyCoords = useCallback((lat, lng) => {
+    const txt = coordFormat === 'dms'
+      ? `${Math.abs(lat).toFixed(6)}${lat>=0?'N':'S'} ${Math.abs(lng).toFixed(6)}${lng>=0?'E':'W'}`
+      : `${lat.toFixed(6)}, ${lng.toFixed(6)}`
+    navigator.clipboard.writeText(txt).then(
+      () => showToast(`Copied: ${txt}`, 'info'),
+      () => showToast('Clipboard access denied')
+    )
+  }, [coordFormat, showToast])
 
   return (
     <div className={styles.app}>
@@ -147,6 +170,11 @@ export default function App() {
         onExport={handleExport}
         onImport={handleImport}
         onResetView={() => setFlyTo({ lat: 20, lng: 0, zoom: 2.5 })}
+        measureActive={measureActive}
+        onToggleMeasure={() => setMeasureActive((v) => !v)}
+        coordFormat={coordFormat}
+        onToggleCoordFormat={() => setCoordFormat((f) => f === 'decimal' ? 'dms' : 'decimal')}
+        measureResult={measureResult}
       />
 
       <div className={styles.workspace}>
@@ -169,12 +197,15 @@ export default function App() {
             markersVisible={markersVisible}
             overlayVisibility={overlayVisibility}
             selectedMarker={selectedMarker}
-            onMapClick={setPendingCoords}
+            onMapClick={measureActive ? () => {} : setPendingCoords}
             onMarkerClick={setSelectedMarker}
             flyTo={flyTo}
             onFlyToDone={() => setFlyTo(null)}
             fitAllTrigger={fitAllTrigger}
             searchPin={searchPin}
+            measureActive={measureActive}
+            onMeasureResult={handleMeasureResult}
+            coordFormat={coordFormat}
           />
         </div>
 
@@ -185,11 +216,13 @@ export default function App() {
             onDelete={handleDeleteMarker}
             onLocate={handleLocateMarker}
             onEdit={setEditingMarker}
+            onCopyCoords={handleCopyCoords}
+            coordFormat={coordFormat}
           />
         )}
       </div>
 
-      {pendingCoords && (
+      {pendingCoords && !measureActive && (
         <MarkerModal mode="add" coords={pendingCoords}
           onConfirm={handleAddMarker} onCancel={() => setPendingCoords(null)} />
       )}
