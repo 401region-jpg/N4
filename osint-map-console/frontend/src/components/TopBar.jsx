@@ -1,5 +1,5 @@
 import { useState, useRef } from 'react'
-import { BASEMAPS } from '../hooks/basemaps.js'
+import { BASEMAP_IDS, BASEMAP_LABELS } from '../hooks/basemaps.js'
 import styles from '../styles/TopBar.module.css'
 
 const NOMINATIM = 'https://nominatim.openstreetmap.org/search'
@@ -15,12 +15,9 @@ export default function TopBar({
   const debounceRef  = useRef(null)
   const fileInputRef = useRef(null)
 
-  const handleQueryChange = (e) => {
-    const val = e.target.value
-    setQuery(val)
-    setNoResults(false)
+  const doSearch = (val) => {
     clearTimeout(debounceRef.current)
-    if (val.length < 3) { setResults([]); return }
+    if (val.length < 3) { setResults([]); setNoResults(false); return }
     debounceRef.current = setTimeout(async () => {
       setSearching(true)
       try {
@@ -36,7 +33,12 @@ export default function TopBar({
       } finally {
         setSearching(false)
       }
-    }, 400)
+    }, 380)
+  }
+
+  const handleQueryChange = (e) => {
+    setQuery(e.target.value)
+    doSearch(e.target.value)
   }
 
   const handleSelect = (r) => {
@@ -48,14 +50,9 @@ export default function TopBar({
 
   const closeDropdown = () => { setResults([]); setNoResults(false) }
 
-  const handleFileChange = (e) => {
-    const file = e.target.files?.[0]
-    if (file) onImport(file)
-    e.target.value = ''
-  }
-
   return (
     <div className={styles.topbar}>
+      {/* Logo */}
       <div className={styles.logo}>
         <span className={styles.logoIcon}>◈</span>
         <span className={styles.logoText}>OSINT<span className={styles.logoSub}>MAP</span></span>
@@ -70,65 +67,52 @@ export default function TopBar({
             placeholder="SEARCH LOCATION..."
             value={query}
             onChange={handleQueryChange}
-            onKeyDown={(e) => e.key === 'Escape' && closeDropdown()}
+            onKeyDown={(e) => { if (e.key === 'Escape') closeDropdown() }}
           />
           {searching && <span className={styles.spinner}>◌</span>}
         </div>
-
         {(results.length > 0 || noResults) && (
           <ul className={styles.dropdown}>
-            {noResults ? (
-              <li className={styles.dropdownEmpty}>Nothing found</li>
-            ) : results.map((r) => (
-              <li key={r.place_id} className={styles.dropdownItem} onClick={() => handleSelect(r)}>
-                <span className={styles.dropdownName}>{r.display_name.split(',').slice(0, 2).join(', ')}</span>
-                <span className={styles.dropdownType}>{r.type?.toUpperCase()}</span>
-              </li>
-            ))}
+            {noResults
+              ? <li className={styles.dropdownEmpty}>Nothing found</li>
+              : results.map((r) => (
+                  <li key={r.place_id} className={styles.dropdownItem} onClick={() => handleSelect(r)}>
+                    <span className={styles.dropdownName}>{r.display_name.split(',').slice(0, 2).join(', ')}</span>
+                    <span className={styles.dropdownType}>{r.type?.toUpperCase()}</span>
+                  </li>
+                ))
+            }
           </ul>
         )}
       </div>
 
       {/* Basemap */}
       <div className={styles.basemapSwitcher}>
-        {Object.values(BASEMAPS).map((bm) => (
+        {BASEMAP_IDS.map((id) => (
           <button
-            key={bm.id}
-            className={`${styles.bmBtn} ${basemap === bm.id ? styles.bmActive : ''}`}
-            onClick={() => onBasemapChange(bm.id)}
+            key={id}
+            className={`${styles.bmBtn} ${basemap === id ? styles.bmActive : ''}`}
+            onClick={() => onBasemapChange(id)}
           >
-            {bm.label}
+            {BASEMAP_LABELS[id]}
           </button>
         ))}
       </div>
 
       {/* Reset view */}
-      <button className={styles.iconBtn} onClick={onResetView} title="Reset view to world">
-        ⊕
-      </button>
+      <button className={styles.iconBtn} onClick={onResetView} title="Reset view">⊕</button>
 
       {/* IO */}
       <div className={styles.ioButtons}>
-        <button className={styles.ioBtn} onClick={onExport} title="Export markers as GeoJSON">
-          ↓ EXPORT
-        </button>
-        <button className={styles.ioBtn} onClick={() => fileInputRef.current?.click()} title="Import GeoJSON">
-          ↑ IMPORT
-        </button>
-        <input
-          ref={fileInputRef}
-          type="file"
-          accept=".geojson,.json"
-          style={{ display: 'none' }}
-          onChange={handleFileChange}
-        />
+        <button className={styles.ioBtn} onClick={onExport} title="Export GeoJSON">↓ EXPORT</button>
+        <button className={styles.ioBtn} onClick={() => fileInputRef.current?.click()} title="Import GeoJSON">↑ IMPORT</button>
+        <input ref={fileInputRef} type="file" accept=".geojson,.json"
+          style={{ display: 'none' }} onChange={(e) => { const f = e.target.files?.[0]; if (f) onImport(f); e.target.value = '' }} />
       </div>
 
       {/* Status */}
       <div className={styles.status}>
-        <span className={`${styles.statusDot} ${
-          backendOk === null ? styles.pending : backendOk ? styles.online : styles.offline
-        }`} />
+        <span className={`${styles.statusDot} ${backendOk === null ? styles.pending : backendOk ? styles.online : styles.offline}`} />
         <span className={styles.statusText}>
           {backendOk === null ? 'CONNECTING' : backendOk ? 'API ONLINE' : 'API OFFLINE'}
         </span>
