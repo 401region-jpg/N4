@@ -7,6 +7,7 @@ export default function Sidebar({
   onDeleteMarker,
   markersVisible,
   onToggleMarkers,
+  onFitAll,
 }) {
   return (
     <div className={styles.sidebar}>
@@ -15,8 +16,8 @@ export default function Sidebar({
         <span className={styles.headerCount}>{markers.length} OBJ</span>
       </div>
 
-      {/* Layer row: User Markers (real toggle) */}
       <div className={styles.layerList}>
+        {/* User Markers — real toggle */}
         <div className={`${styles.layerRow} ${markersVisible ? styles.layerActive : ''}`}>
           <span className={styles.layerIcon}>◈</span>
           <span className={styles.layerLabel}>USER MARKERS</span>
@@ -24,17 +25,16 @@ export default function Sidebar({
           <button
             className={`${styles.toggleBtn} ${markersVisible ? styles.toggleOn : styles.toggleOff}`}
             onClick={onToggleMarkers}
-            title={markersVisible ? 'Hide markers' : 'Show markers'}
+            title={markersVisible ? 'Hide' : 'Show'}
           >
             {markersVisible ? '◉' : '○'}
           </button>
         </div>
 
-        {/* Placeholder layers (coming soon) */}
         {[
           { label: 'GRID OVERLAY', icon: '⊞' },
-          { label: 'ROUTES', icon: '⇒' },
-          { label: 'ZONES', icon: '◻' },
+          { label: 'ROUTES',       icon: '⇒' },
+          { label: 'ZONES',        icon: '◻' },
         ].map((l) => (
           <div key={l.label} className={`${styles.layerRow} ${styles.layerDisabled}`}>
             <span className={styles.layerIcon}>{l.icon}</span>
@@ -46,18 +46,26 @@ export default function Sidebar({
 
       <div className={styles.divider} />
 
+      {/* Objects header + FIT ALL */}
       <div className={styles.objectsHeader}>
         <span>OBJECTS</span>
+        <button
+          className={styles.fitBtn}
+          onClick={onFitAll}
+          disabled={markers.length === 0}
+          title={markers.length === 0 ? 'No markers' : 'Fit map to all markers'}
+        >
+          FIT ALL
+        </button>
       </div>
 
       <div className={styles.markerList}>
-        {markers.length === 0 && (
+        {markers.length === 0 ? (
           <div className={styles.empty}>
             <span>NO MARKERS</span>
             <span className={styles.emptyHint}>Click map to add</span>
           </div>
-        )}
-        {markers.map((m) => (
+        ) : markers.map((m) => (
           <div
             key={m.id}
             className={`${styles.markerItem} ${selectedMarker?.id === m.id ? styles.markerSelected : ''}`}
