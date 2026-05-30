@@ -339,6 +339,10 @@ export default function MapView({
     map.once('load', () => {
       // Apply correct initial basemap (effect may have run before load)
       applyBasemap(map, DEFAULT_BASEMAP)
+      // Warm all basemap raster tiles once so visibility switches are instant
+      // (MapLibre skips tile fetches for hidden layers; prefetch avoids the
+      // blank/partial render that previously needed a pan/zoom to refresh).
+      prefetchBasemapTiles(map)
       // Apply initial overlay visibility
       const ov = overlayRef.current || {}
       Object.entries(OVERLAY_GROUPS).forEach(([key]) => {
@@ -419,11 +423,13 @@ export default function MapView({
   }, [overlayVisibility])
 
   // ── Re-draw markers ───────────────────────────────────────────────────────
+  // Scoped to marker-relevant props so a basemap/overlay toggle never clears and
+  // re-adds every marker (which caused flicker on switch).
   useEffect(() => {
     const map = mapRef.current
     if (!map || !map.isStyleLoaded()) return
     drawMarkers(map)
-  })
+  }, [markers, markersVisible, selectedMarker?.id])
 
   // ── AOI data sync ─────────────────────────────────────────────────────────
   useEffect(() => {

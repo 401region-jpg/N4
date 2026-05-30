@@ -48,8 +48,26 @@ export const OVERLAY_GROUPS = {
   cities:    ['ov-city-dot', 'ov-city-label'],
 }
 
+// Warm every basemap raster layer's tiles once. MapLibre only requests tiles
+// for layers that are currently visible, so the first switch to satellite/hybrid
+// otherwise renders blank until tiles stream in (and needs a pan/zoom to wake up).
+// We briefly flip each hidden raster layer to 'visible' to kick off the fetch,
+// then immediately restore the real basemap visibility — the tiles stay cached.
+export function prefetchBasemapTiles(map) {
+  if (!map || !map.isStyleLoaded()) return
+  ALL_BASEMAP_LAYERS.forEach((id) => {
+    if (map.getLayer(id)) map.setLayoutProperty(id, 'visibility', 'visible')
+  })
+  // Restore correct visibility on the next frame, after tile requests are queued.
+  requestAnimationFrame(() => {
+    const current = map.__osintBasemap || DEFAULT_BASEMAP
+    applyBasemap(map, current)
+  })
+}
+
 export function applyBasemap(map, basemapId) {
   if (!map || !map.isStyleLoaded()) return
+  map.__osintBasemap = basemapId
   const active = new Set(BASEMAP_LAYER_SETS[basemapId] || [])
   ALL_BASEMAP_LAYERS.forEach((id) => {
     if (map.getLayer(id))
