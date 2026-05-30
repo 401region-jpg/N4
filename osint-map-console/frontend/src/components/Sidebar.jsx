@@ -1,5 +1,14 @@
 import styles from '../styles/Sidebar.module.css'
 
+const STATIC_LAYERS = [
+  { key: 'countries', label: 'COUNTRIES',  icon: '◫', implemented: true },
+  { key: 'regions',   label: 'REGIONS',    icon: '⊟', implemented: false },
+  { key: 'cities',    label: 'CITIES',     icon: '⊙', implemented: false },
+  { key: 'grid',      label: 'GRID',       icon: '⊞', implemented: false },
+  { key: 'routes',    label: 'ROUTES',     icon: '⇒', implemented: false },
+  { key: 'zones',     label: 'ZONES',      icon: '◻', implemented: false },
+]
+
 export default function Sidebar({
   markers,
   selectedMarker,
@@ -7,6 +16,8 @@ export default function Sidebar({
   onDeleteMarker,
   markersVisible,
   onToggleMarkers,
+  overlayVisibility,
+  onToggleOverlay,
   onFitAll,
 }) {
   return (
@@ -17,43 +28,33 @@ export default function Sidebar({
       </div>
 
       <div className={styles.layerList}>
-        {/* User Markers — real toggle */}
-        <div className={`${styles.layerRow} ${markersVisible ? styles.layerActive : ''}`}>
-          <span className={styles.layerIcon}>◈</span>
-          <span className={styles.layerLabel}>USER MARKERS</span>
-          <span className={styles.layerBadge}>{markers.length}</span>
-          <button
-            className={`${styles.toggleBtn} ${markersVisible ? styles.toggleOn : styles.toggleOff}`}
-            onClick={onToggleMarkers}
-            title={markersVisible ? 'Hide' : 'Show'}
-          >
-            {markersVisible ? '◉' : '○'}
-          </button>
-        </div>
-
-        {[
-          { label: 'GRID OVERLAY', icon: '⊞' },
-          { label: 'ROUTES',       icon: '⇒' },
-          { label: 'ZONES',        icon: '◻' },
-        ].map((l) => (
-          <div key={l.label} className={`${styles.layerRow} ${styles.layerDisabled}`}>
-            <span className={styles.layerIcon}>{l.icon}</span>
-            <span className={styles.layerLabel}>{l.label}</span>
-            <span className={styles.layerSoon}>SOON</span>
-          </div>
+        {/* User Markers */}
+        <LayerRow
+          icon="◈" label="USER MARKERS" badge={markers.length}
+          active={markersVisible} onToggle={onToggleMarkers}
+          implemented
+        />
+        {/* Overlay layers */}
+        {STATIC_LAYERS.map((l) => (
+          <LayerRow
+            key={l.key}
+            icon={l.icon} label={l.label}
+            active={l.implemented ? (overlayVisibility?.[l.key] ?? false) : false}
+            onToggle={l.implemented ? () => onToggleOverlay(l.key) : null}
+            implemented={l.implemented}
+          />
         ))}
       </div>
 
       <div className={styles.divider} />
 
-      {/* Objects header + FIT ALL */}
       <div className={styles.objectsHeader}>
         <span>OBJECTS</span>
         <button
           className={styles.fitBtn}
           onClick={onFitAll}
           disabled={markers.length === 0}
-          title={markers.length === 0 ? 'No markers' : 'Fit map to all markers'}
+          title={markers.length === 0 ? 'No markers' : 'Fit to all markers'}
         >
           FIT ALL
         </button>
@@ -85,6 +86,26 @@ export default function Sidebar({
           </div>
         ))}
       </div>
+    </div>
+  )
+}
+
+function LayerRow({ icon, label, badge, active, onToggle, implemented }) {
+  return (
+    <div className={`${styles.layerRow} ${active ? styles.layerActive : ''} ${!implemented ? styles.layerDisabled : ''}`}>
+      <span className={styles.layerIcon}>{icon}</span>
+      <span className={styles.layerLabel}>{label}</span>
+      {badge !== undefined && <span className={styles.layerBadge}>{badge}</span>}
+      {!implemented && <span className={styles.layerSoon}>SOON</span>}
+      {implemented && (
+        <button
+          className={`${styles.toggleBtn} ${active ? styles.toggleOn : styles.toggleOff}`}
+          onClick={onToggle}
+          title={active ? 'Hide' : 'Show'}
+        >
+          {active ? '◉' : '○'}
+        </button>
+      )}
     </div>
   )
 }
