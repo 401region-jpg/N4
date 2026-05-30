@@ -10,6 +10,7 @@ export default function TopBar({
   measureActive, onToggleMeasure,
   coordFormat, onToggleCoordFormat,
   measureResult,
+  drawMode, onSetDrawMode,
 }) {
   const [query,     setQuery]     = useState('')
   const [results,   setResults]   = useState([])
@@ -105,6 +106,25 @@ export default function TopBar({
         {measureActive && measureResult && (
           <span className={styles.measureResult}>{measureResult}</span>
         )}
+
+        <button
+          className={`${styles.toolBtn} ${drawMode === 'polygon' ? styles.toolActive : ''}`}
+          onClick={() => onSetDrawMode('polygon')}
+          title="Draw zone (click vertices, double-click / Enter to finish, Esc to cancel)">
+          ◻ ZONE
+        </button>
+        <button
+          className={`${styles.toolBtn} ${drawMode === 'route' ? styles.toolActive : ''}`}
+          onClick={() => onSetDrawMode('route')}
+          title="Draw route (click points, double-click / Enter to finish, Esc to cancel)">
+          ⇒ ROUTE
+        </button>
+        <button
+          className={`${styles.toolBtn} ${drawMode === 'circle' ? styles.toolActive : ''}`}
+          onClick={() => onSetDrawMode('circle')}
+          title="Draw circle AOI (click center, then click for radius)">
+          ◯ CIRCLE
+        </button>
 
         <button
           className={styles.toolBtn}

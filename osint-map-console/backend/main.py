@@ -2,8 +2,9 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, field_validator, model_validator
-from typing import Optional
+from typing import Optional, Any
 import sqlite3
+import json
 import time
 import os
 
@@ -11,6 +12,11 @@ DB_PATH = os.path.join(os.path.dirname(__file__), "markers.db")
 
 ALLOWED_COLORS = {"#00ff88", "#00e5ff", "#ffcc00", "#ff3b5c", "#ff8c00", "#bf5fff"}
 DEFAULT_COLOR = "#00ff88"
+
+# Stage 2 — AOI / geometry objects.
+AOI_KINDS = {"aoi", "site", "base", "airfield", "port", "depot", "checkpoint", "route", "zone", "observation"}
+DEFAULT_AOI_KIND = "aoi"
+GEOM_TYPES = {"Point", "LineString", "Polygon", "MultiPolygon", "MultiLineString"}
 
 app = FastAPI(title="OSINT Map Console API")
 
@@ -39,6 +45,17 @@ def init_db():
             title TEXT NOT NULL DEFAULT 'Marker',
             note TEXT DEFAULT '',
             color TEXT DEFAULT '#00ff88',
+            created_at INTEGER NOT NULL
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS aoi (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            kind TEXT NOT NULL DEFAULT 'aoi',
+            title TEXT NOT NULL DEFAULT 'AOI',
+            note TEXT DEFAULT '',
+            color TEXT DEFAULT '#00e5ff',
+            geometry TEXT NOT NULL,
             created_at INTEGER NOT NULL
         )
     """)
@@ -227,6 +244,188 @@ def import_geojson(body: dict):
             skipped += 1
             continue
 
+    conn.commit()
+    conn.close()
+    return {"imported": imported, "skipped": skipped}
+
+
+# ── AOI / geometry objects (Stage 2) ─────────────────────────────────────────
+
+def _validate_geometry(geom: Any) -> dict:
+    if not isinstance(geom, dict):
+        raise ValueError("geometry must be an object")
+    gtype = geom.get("type")
+    if gtype not in GEOM_TYPES:
+        raise ValueError(f"geometry.type must be one of {sorted(GEOM_TYPES)}")
+    if not isinstance(geom.get("coordinates"), list):
+        raise ValueError("geometry.coordinates must be an array")
+    return {"type": gtype, "coordinates": geom["coordinates"]}
+
+
+class AoiCreate(BaseModel):
+    kind: Optional[str] = DEFAULT_AOI_KIND
+    title: Optional[str] = "AOI"
+    note: Optional[str] = ""
+    color: Optional[str] = "#00e5ff"
+    geometry: dict
+
+    @model_validator(mode="after")
+    def sanitize(self):
+        self.kind = (self.kind or DEFAULT_AOI_KIND)
+        if self.kind not in AOI_KINDS:
+            self.kind = DEFAULT_AOI_KIND
+        self.title = (self.title or "").strip() or "AOI"
+        self.note = (self.note or "").strip()
+        if self.color not in ALLOWED_COLORS:
+            self.color = "#00e5ff"
+        self.geometry = _validate_geometry(self.geometry)
+        return self
+
+
+class AoiUpdate(BaseModel):
+    kind: Optional[str] = None
+    title: Optional[str] = None
+    note: Optional[str] = None
+    color: Optional[str] = None
+    geometry: Optional[dict] = None
+
+    @model_validator(mode="after")
+    def sanitize(self):
+        if self.kind is not None and self.kind not in AOI_KINDS:
+            self.kind = DEFAULT_AOI_KIND
+        if self.title is not None:
+            self.title = self.title.strip() or "AOI"
+        if self.note is not None:
+            self.note = self.note.strip()
+        if self.color is not None and self.color not in ALLOWED_COLORS:
+            self.color = "#00e5ff"
+        if self.geometry is not None:
+            self.geometry = _validate_geometry(self.geometry)
+        return self
+
+
+def _aoi_row_to_dict(r) -> dict:
+    return {
+        "id": r["id"],
+        "kind": r["kind"],
+        "title": r["title"],
+        "note": r["note"],
+        "color": r["color"],
+        "geometry": json.loads(r["geometry"]),
+        "created_at": r["created_at"],
+    }
+
+
+@app.get("/api/aoi")
+def list_aoi():
+    conn = get_db()
+    rows = conn.execute("SELECT * FROM aoi ORDER BY created_at DESC").fetchall()
+    conn.close()
+    return [_aoi_row_to_dict(r) for r in rows]
+
+
+@app.post("/api/aoi", status_code=201)
+def create_aoi(aoi: AoiCreate):
+    conn = get_db()
+    now = int(time.time())
+    cur = conn.execute(
+        "INSERT INTO aoi (kind, title, note, color, geometry, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+        (aoi.kind, aoi.title, aoi.note, aoi.color, json.dumps(aoi.geometry), now),
+    )
+    conn.commit()
+    row = conn.execute("SELECT * FROM aoi WHERE id = ?", (cur.lastrowid,)).fetchone()
+    conn.close()
+    return _aoi_row_to_dict(row)
+
+
+@app.put("/api/aoi/{aoi_id}")
+def update_aoi(aoi_id: int, data: AoiUpdate):
+    conn = get_db()
+    row = conn.execute("SELECT * FROM aoi WHERE id = ?", (aoi_id,)).fetchone()
+    if not row:
+        conn.close()
+        raise HTTPException(status_code=404, detail="AOI not found")
+
+    kind = data.kind if data.kind is not None else row["kind"]
+    title = data.title if data.title is not None else row["title"]
+    note = data.note if data.note is not None else row["note"]
+    color = data.color if data.color is not None else row["color"]
+    geometry = json.dumps(data.geometry) if data.geometry is not None else row["geometry"]
+
+    conn.execute(
+        "UPDATE aoi SET kind = ?, title = ?, note = ?, color = ?, geometry = ? WHERE id = ?",
+        (kind, title, note, color, geometry, aoi_id),
+    )
+    conn.commit()
+    updated = conn.execute("SELECT * FROM aoi WHERE id = ?", (aoi_id,)).fetchone()
+    conn.close()
+    return _aoi_row_to_dict(updated)
+
+
+@app.delete("/api/aoi/{aoi_id}", status_code=204)
+def delete_aoi(aoi_id: int):
+    conn = get_db()
+    result = conn.execute("DELETE FROM aoi WHERE id = ?", (aoi_id,))
+    conn.commit()
+    conn.close()
+    if result.rowcount == 0:
+        raise HTTPException(status_code=404, detail="AOI not found")
+    return None
+
+
+@app.get("/api/aoi/export.geojson")
+def export_aoi_geojson():
+    conn = get_db()
+    rows = conn.execute("SELECT * FROM aoi ORDER BY created_at DESC").fetchall()
+    conn.close()
+    features = []
+    for r in rows:
+        features.append({
+            "type": "Feature",
+            "geometry": json.loads(r["geometry"]),
+            "properties": {
+                "id": r["id"], "kind": r["kind"], "title": r["title"],
+                "note": r["note"], "color": r["color"], "created_at": r["created_at"],
+            },
+        })
+    return JSONResponse(
+        content={"type": "FeatureCollection", "features": features},
+        headers={"Content-Disposition": "attachment; filename=aoi.geojson"},
+    )
+
+
+@app.post("/api/aoi/import.geojson")
+def import_aoi_geojson(body: dict):
+    if body.get("type") != "FeatureCollection":
+        raise HTTPException(status_code=400, detail="Expected GeoJSON FeatureCollection")
+    features = body.get("features", [])
+    if not isinstance(features, list):
+        raise HTTPException(status_code=400, detail="features must be an array")
+
+    conn = get_db()
+    now = int(time.time())
+    imported = 0
+    skipped = 0
+    for f in features:
+        try:
+            geom = _validate_geometry(f.get("geometry"))
+            props = f.get("properties") or {}
+            kind = props.get("kind", DEFAULT_AOI_KIND)
+            if kind not in AOI_KINDS:
+                kind = DEFAULT_AOI_KIND
+            title = str(props.get("title", "Imported AOI")).strip() or "Imported AOI"
+            note = str(props.get("note", "")).strip()
+            color = props.get("color", "#00e5ff")
+            if color not in ALLOWED_COLORS:
+                color = "#00e5ff"
+            conn.execute(
+                "INSERT INTO aoi (kind, title, note, color, geometry, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+                (kind, title, note, color, json.dumps(geom), now),
+            )
+            imported += 1
+        except Exception:
+            skipped += 1
+            continue
     conn.commit()
     conn.close()
     return {"imported": imported, "skipped": skipped}

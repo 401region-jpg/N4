@@ -59,6 +59,31 @@ export async function importGeoJSON(geojsonObject) {
   })
 }
 
+// ── AOI / geometry objects (Stage 2) ────────────────────────────────────────
+export async function fetchAois() {
+  return apiFetch('/api/aoi')
+}
+
+export async function createAoi(data) {
+  return apiFetch('/api/aoi', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(data),
+  })
+}
+
+export async function updateAoi(id, data) {
+  return apiFetch(`/api/aoi/${id}`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(data),
+  })
+}
+
+export async function deleteAoi(id) {
+  return apiFetch(`/api/aoi/${id}`, { method: 'DELETE' })
+}
+
 export async function checkHealth() {
   try {
     const res = await fetch(`${API_BASE}/health`)

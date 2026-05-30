@@ -9,7 +9,11 @@ import {
   DEFAULT_BASEMAP,
 } from '../hooks/basemaps.js'
 import { attachGridCanvas, haversineMeters, formatDistance } from '../hooks/gridLayer.js'
-import styles from '../styles/MapView.module.css'
+import {
+  ensureAoiLayers, setAoiData, clearDraft, DRAFT_SOURCE,
+  circleToPolygon, ringAreaMeters, formatArea, lineLengthMeters,
+} from '../hooks/aoiLayer.js'
+import styles from './MapView.module.css'
 
 const DEFAULT_CENTER = [0, 20]
 const DEFAULT_ZOOM   = 2.5
@@ -40,6 +44,13 @@ export default function MapView({
   measureActive,        // bool — measure mode on/off
   onMeasureResult,      // (distanceStr | null) => void
   coordFormat,          // 'decimal' | 'dms'
+  onCopyCoords,         // (lat, lng) => void — copy cursor coords
+  aois,                 // AOI rows [{id, geometry, color, ...}]
+  selectedAoiId,        // currently selected AOI id
+  onAoiClick,           // (id) => void
+  drawMode,             // 'polygon' | 'route' | 'circle' | null
+  onAoiComplete,        // (geometry, { kind, metric }) => void
+  onDrawCancel,         // () => void
 }) {
   const containerRef   = useRef(null)
   const gridCanvasRef  = useRef(null)
@@ -49,6 +60,22 @@ export default function MapView({
   const gridCleanupRef = useRef(null)
   const coordsRef      = useRef(null)
   const zoomRef        = useRef(null)
+  const lastLngLatRef  = useRef(null)
+  const onCopyCoordsRef = useRef(onCopyCoords)
+  onCopyCoordsRef.current = onCopyCoords
+
+  // AOI draw state (refs to avoid re-renders on each vertex)
+  const drawRef = useRef({ points: [], circleCenter: null })
+  const drawModeRef     = useRef(drawMode)
+  const onAoiCompleteRef = useRef(onAoiComplete)
+  const onAoiClickRef    = useRef(onAoiClick)
+  const aoisRef          = useRef(aois)
+  const selectedAoiIdRef = useRef(selectedAoiId ?? null)
+  drawModeRef.current      = drawMode
+  onAoiCompleteRef.current = onAoiComplete
+  onAoiClickRef.current    = onAoiClick
+  aoisRef.current          = aois
+  selectedAoiIdRef.current = selectedAoiId ?? null
 
   // Measure state (lives in refs to avoid re-render on every mousemove)
   const measureRef = useRef({ active: false, pointA: null, line: null, popup: null })
@@ -139,6 +166,54 @@ export default function MapView({
     })
   }
 
+  // ── AOI draw helpers ───────────────────────────────────────────────────────
+  function renderDraft(map) {
+    const src = map.getSource(DRAFT_SOURCE)
+    if (!src) return
+    const mode = drawModeRef.current
+    const pts  = drawRef.current.points
+    const features = []
+
+    // vertices
+    pts.forEach((p) => features.push({ type: 'Feature', geometry: { type: 'Point', coordinates: p }, properties: {} }))
+
+    if (mode === 'circle' && drawRef.current.circleCenter && pts.length === 1) {
+      // center placed, waiting for radius — nothing extra
+    } else if (mode === 'route' && pts.length >= 2) {
+      features.push({ type: 'Feature', geometry: { type: 'LineString', coordinates: pts }, properties: {} })
+    } else if (mode === 'polygon' && pts.length >= 2) {
+      const coords = pts.length >= 3 ? [...pts, pts[0]] : pts
+      features.push({
+        type: 'Feature',
+        geometry: pts.length >= 3 ? { type: 'Polygon', coordinates: [coords] } : { type: 'LineString', coordinates: coords },
+        properties: {},
+      })
+    }
+    src.setData({ type: 'FeatureCollection', features })
+  }
+
+  function resetDraft(map) {
+    drawRef.current = { points: [], circleCenter: null }
+    if (map) clearDraft(map)
+  }
+
+  function finishDraw(map) {
+    const mode = drawModeRef.current
+    const pts  = drawRef.current.points
+    if (!mode) return
+
+    if (mode === 'polygon' && pts.length >= 3) {
+      const ring = [...pts, pts[0]]
+      const geometry = { type: 'Polygon', coordinates: [ring] }
+      onAoiCompleteRef.current?.(geometry, { kind: 'zone', metric: `Area ${formatArea(ringAreaMeters(pts))}` })
+      resetDraft(map)
+    } else if (mode === 'route' && pts.length >= 2) {
+      const geometry = { type: 'LineString', coordinates: pts }
+      onAoiCompleteRef.current?.(geometry, { kind: 'route', metric: `Length ${formatDistance(lineLengthMeters(pts))}` })
+      resetDraft(map)
+    }
+  }
+
   // ── Init map ──────────────────────────────────────────────────────────────
   useEffect(() => {
     const map = new maplibregl.Map({
@@ -155,6 +230,7 @@ export default function MapView({
 
     // Coords display + zoom display
     map.on('mousemove', (e) => {
+      lastLngLatRef.current = e.lngLat
       if (!coordsRef.current) return
       const { lat, lng } = e.lngLat
       if (coordFmtRef.current === 'dms') {
@@ -173,9 +249,34 @@ export default function MapView({
       }
     })
 
-    // Map click: measure or place marker
+    // Map click: draw AOI / measure / place marker
     map.on('click', (e) => {
       const { lat, lng } = e.lngLat
+
+      // ── AOI draw mode takes priority ──
+      const mode = drawModeRef.current
+      if (mode) {
+        if (mode === 'circle') {
+          const d = drawRef.current
+          if (!d.circleCenter) {
+            d.circleCenter = [lng, lat]
+            d.points = [[lng, lat]]
+            renderDraft(map)
+          } else {
+            const radius = haversineMeters(
+              { lat: d.circleCenter[1], lng: d.circleCenter[0] }, { lat, lng })
+            const geometry = circleToPolygon(d.circleCenter, radius)
+            onAoiCompleteRef.current?.(geometry, {
+              kind: 'aoi', metric: `Radius ${formatDistance(radius)}`,
+            })
+            resetDraft(map)
+          }
+        } else {
+          drawRef.current.points.push([lng, lat])
+          renderDraft(map)
+        }
+        return
+      }
 
       if (measureActiveRef.current) {
         const ms = measureRef.current
@@ -219,7 +320,20 @@ export default function MapView({
         return
       }
 
+      // Don't drop a marker when the click lands on an existing AOI feature —
+      // the per-layer handler will select it instead.
+      const aoiLayers = ['aoi-fill', 'aoi-line', 'aoi-point'].filter((l) => map.getLayer(l))
+      if (aoiLayers.length && map.queryRenderedFeatures(e.point, { layers: aoiLayers }).length) return
+
       onMapClickRef.current({ lat, lng })
+    })
+
+    // Double-click finishes polygon/route (suppress default zoom while drawing)
+    map.on('dblclick', (e) => {
+      if (drawModeRef.current === 'polygon' || drawModeRef.current === 'route') {
+        e.preventDefault()
+        finishDraw(map)
+      }
     })
 
     map.once('load', () => {
@@ -230,6 +344,23 @@ export default function MapView({
       Object.entries(OVERLAY_GROUPS).forEach(([key]) => {
         applyOverlay(map, key, ov[key] ?? (key === 'countries'))
       })
+
+      // AOI layers + initial data
+      ensureAoiLayers(map)
+      setAoiData(map, aoisRef.current, selectedAoiIdRef.current)
+
+      // Click an AOI to select it (only when not drawing/measuring)
+      const aoiSelect = (e) => {
+        if (drawModeRef.current || measureActiveRef.current) return
+        const id = e.features?.[0]?.properties?.id
+        if (id != null) { e.originalEvent?.stopPropagation?.(); onAoiClickRef.current?.(id) }
+      }
+      ;['aoi-fill', 'aoi-line', 'aoi-point'].forEach((lid) => {
+        map.on('click', lid, aoiSelect)
+        map.on('mouseenter', lid, () => { if (!drawModeRef.current) map.getCanvas().style.cursor = 'pointer' })
+        map.on('mouseleave', lid, () => { map.getCanvas().style.cursor = '' })
+      })
+
       drawMarkers(map)
 
       // Attach grid canvas
@@ -293,6 +424,41 @@ export default function MapView({
     if (!map || !map.isStyleLoaded()) return
     drawMarkers(map)
   })
+
+  // ── AOI data sync ─────────────────────────────────────────────────────────
+  useEffect(() => {
+    const map = mapRef.current
+    if (!map) return
+    const apply = () => { ensureAoiLayers(map); setAoiData(map, aois, selectedAoiId ?? null) }
+    if (map.isStyleLoaded()) apply()
+    else map.once('load', apply)
+  }, [aois, selectedAoiId])
+
+  // ── Draw mode: cursor + cancel cleanup ──────────────────────────────────────
+  useEffect(() => {
+    const map = mapRef.current
+    if (!map) return
+    const canvas = map.getCanvas()
+    if (drawMode) {
+      canvas.style.cursor = 'crosshair'
+      map.doubleClickZoom.disable()
+    } else {
+      canvas.style.cursor = ''
+      map.doubleClickZoom.enable()
+      resetDraft(map)
+    }
+
+    const onKey = (ev) => {
+      if (!drawModeRef.current) return
+      if (ev.key === 'Escape') { resetDraft(map); onDrawCancel?.() }
+      else if (ev.key === 'Enter') { finishDraw(map) }
+    }
+    window.addEventListener('keydown', onKey)
+    return () => {
+      window.removeEventListener('keydown', onKey)
+      if (map.doubleClickZoom) map.doubleClickZoom.enable()
+    }
+  }, [drawMode, onDrawCancel])
 
   // ── Search pin ────────────────────────────────────────────────────────────
   useEffect(() => {
@@ -379,11 +545,19 @@ export default function MapView({
 
       {/* HUD bottom-left */}
       <div className={styles.hud}>
-        <span ref={coordsRef} className={styles.coords} />
+        <span
+          ref={coordsRef}
+          className={styles.coords}
+          title="Click to copy cursor coordinates"
+          onClick={() => {
+            const ll = lastLngLatRef.current || mapRef.current?.getCenter()
+            if (ll && onCopyCoordsRef.current) onCopyCoordsRef.current(ll.lat, ll.lng)
+          }}
+        />
         <span ref={zoomRef}   className={styles.zoom} />
       </div>
 
-      <div className={styles.hint}>◈ CLICK TO PLACE MARKER</div>
+      <div className={styles.hint}>◈ CLICK MAP TO PLACE MARKER · CLICK COORDS TO COPY</div>
 
       <style>{`
         @keyframes osint-pulse {

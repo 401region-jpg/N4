@@ -1,15 +1,17 @@
 import styles from '../styles/Sidebar.module.css'
 
-// Countries, Regions, Cities, Grid are implemented.
-// Routes, Zones remain disabled.
+// Countries, Cities, Grid are implemented.
+// Regions needs a global admin-1 vector source we don't have keyless; Routes/Zones land in Stage 2.
 const OVERLAY_LAYERS = [
   { key: 'countries', label: 'COUNTRIES', icon: '◫', impl: true },
-  { key: 'regions',   label: 'REGIONS',   icon: '⊟', impl: true },
   { key: 'cities',    label: 'CITIES',    icon: '⊙', impl: true },
   { key: 'grid',      label: 'GRID',      icon: '⊞', impl: true },
+  { key: 'regions',   label: 'REGIONS',   icon: '⊟', impl: false },
   { key: 'routes',    label: 'ROUTES',    icon: '⇒', impl: false },
   { key: 'zones',     label: 'ZONES',     icon: '◻', impl: false },
 ]
+
+const AOI_ICONS = { route: '⇒', zone: '◻', aoi: '◯', site: '◈', base: '▣', airfield: '✈', port: '⚓', depot: '▤', checkpoint: '⊘', observation: '◉' }
 
 export default function Sidebar({
   markers, selectedMarker,
@@ -17,6 +19,7 @@ export default function Sidebar({
   markersVisible, onToggleMarkers,
   overlayVisibility, onToggleOverlay,
   onFitAll,
+  aois = [], selectedAoiId, onSelectAoi, onDeleteAoi,
 }) {
   return (
     <div className={styles.sidebar}>
@@ -67,6 +70,37 @@ export default function Sidebar({
             </div>
             <button className={styles.deleteBtn}
               onClick={(e) => { e.stopPropagation(); onDeleteMarker(m.id) }}>✕</button>
+          </div>
+        ))}
+      </div>
+
+      <div className={styles.divider} />
+
+      <div className={styles.objectsHeader}>
+        <span>AOI / GEOMETRY</span>
+        <span className={styles.headerCount}>{aois.length}</span>
+      </div>
+
+      <div className={styles.markerList}>
+        {aois.length === 0 ? (
+          <div className={styles.empty}>
+            <span>NO AOI</span>
+            <span className={styles.emptyHint}>Use ZONE / ROUTE / CIRCLE tools</span>
+          </div>
+        ) : aois.map((a) => (
+          <div key={a.id}
+            className={`${styles.markerItem} ${selectedAoiId === a.id ? styles.markerSelected : ''}`}
+            onClick={() => onSelectAoi(a.id)}>
+            <span className={styles.markerDot}
+              style={{ background: 'transparent', boxShadow: 'none', color: a.color }}>
+              {AOI_ICONS[a.kind] || '◯'}
+            </span>
+            <div className={styles.markerInfo}>
+              <span className={styles.markerTitle}>{a.title}</span>
+              <span className={styles.markerCoords}>{(a.kind || 'aoi').toUpperCase()}{a.note ? ` · ${a.note}` : ''}</span>
+            </div>
+            <button className={styles.deleteBtn}
+              onClick={(e) => { e.stopPropagation(); onDeleteAoi(a.id) }}>✕</button>
           </div>
         ))}
       </div>
