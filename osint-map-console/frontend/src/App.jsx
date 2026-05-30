@@ -8,6 +8,7 @@ import Toast from './components/Toast.jsx'
 import {
   fetchMarkers, createMarker, updateMarker,
   deleteMarker, exportGeoJSON, importGeoJSON, checkHealth,
+  fetchAois, createAoi, deleteAoi,
 } from './hooks/useApi.js'
 import { DEFAULT_BASEMAP } from './hooks/basemaps.js'
 import styles from './styles/App.module.css'
@@ -16,6 +17,19 @@ const INIT_OVERLAY = {
   countries: true,
   cities:    false,
   grid:      false,
+}
+
+// Rough centroid of an AOI geometry for fly-to.
+function aoiCentroid(geom) {
+  if (!geom) return null
+  let coords = []
+  if (geom.type === 'Point') return { lng: geom.coordinates[0], lat: geom.coordinates[1] }
+  if (geom.type === 'LineString') coords = geom.coordinates
+  else if (geom.type === 'Polygon') coords = geom.coordinates[0] || []
+  else if (geom.type === 'MultiPolygon') coords = geom.coordinates[0]?.[0] || []
+  if (!coords.length) return null
+  const sum = coords.reduce((s, c) => [s[0] + c[0], s[1] + c[1]], [0, 0])
+  return { lng: sum[0] / coords.length, lat: sum[1] / coords.length }
 }
 
 export default function App() {
@@ -33,6 +47,9 @@ export default function App() {
   const [measureActive,     setMeasureActive]     = useState(false)
   const [measureResult,     setMeasureResult]     = useState(null)
   const [coordFormat,       setCoordFormat]       = useState('decimal') // 'decimal'|'dms'
+  const [aois,              setAois]              = useState([])
+  const [selectedAoiId,     setSelectedAoiId]     = useState(null)
+  const [drawMode,          setDrawMode]          = useState(null) // 'polygon'|'route'|'circle'|null
   const [toasts,            setToasts]            = useState([])
   const toastIdRef   = useRef(0)
   const searchTimerRef = useRef(null)
@@ -53,8 +70,12 @@ export default function App() {
   useEffect(() => {
     checkHealth().then((ok) => {
       setBackendOk(ok)
-      if (ok) fetchMarkers().then(setMarkers).catch(() => showToast('Failed to load markers'))
-      else    showToast('Backend offline — start uvicorn on port 8000')
+      if (ok) {
+        fetchMarkers().then(setMarkers).catch(() => showToast('Failed to load markers'))
+        fetchAois().then(setAois).catch(() => showToast('Failed to load AOIs'))
+      } else {
+        showToast('Backend offline — start uvicorn on port 8000')
+      }
     })
   }, []) // eslint-disable-line
 
@@ -146,6 +167,43 @@ export default function App() {
     if (distStr) showToast(`Distance: ${distStr}`, 'info')
   }, [showToast])
 
+  // ── AOI / geometry ───────────────────────────────────────────────────────
+  const handleSetDrawMode = useCallback((mode) => {
+    setMeasureActive(false)
+    setDrawMode((prev) => (prev === mode ? null : mode))
+  }, [])
+
+  const handleAoiComplete = useCallback(async (geometry, { kind, metric }) => {
+    setDrawMode(null)
+    const label = kind === 'route' ? 'Route' : kind === 'zone' ? 'Zone' : 'AOI'
+    const title = `${label} ${new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}`
+    const color = kind === 'route' ? '#ff8c00' : '#00e5ff'
+    try {
+      const created = await createAoi({ kind, title, color, geometry, note: metric || '' })
+      setAois((prev) => [created, ...prev])
+      setSelectedAoiId(created.id)
+      showToast(`${label} saved — ${metric || ''}`.trim(), 'success')
+    } catch (e) { showToast(e.message || 'Failed to save AOI') }
+  }, [showToast])
+
+  const handleDeleteAoi = useCallback(async (id) => {
+    try {
+      await deleteAoi(id)
+      setAois((prev) => prev.filter((a) => a.id !== id))
+      setSelectedAoiId((prev) => (prev === id ? null : prev))
+      showToast('AOI deleted', 'success')
+    } catch (e) { showToast(e.message || 'Failed to delete AOI') }
+  }, [showToast])
+
+  const handleSelectAoi = useCallback((id) => {
+    setSelectedAoiId(id)
+    const a = aois.find((x) => x.id === id)
+    if (a) {
+      const c = aoiCentroid(a.geometry)
+      if (c) setFlyTo({ lat: c.lat, lng: c.lng, zoom: 10 })
+    }
+  }, [aois])
+
   // ── Copy center coords ─────────────────────────────────────────────────────
   // Exposed via TopBar; MapView handles its own cursor coords
   // This is a simpler "copy current search/fly coords" feature
@@ -170,10 +228,12 @@ export default function App() {
         onImport={handleImport}
         onResetView={() => setFlyTo({ lat: 20, lng: 0, zoom: 2.5 })}
         measureActive={measureActive}
-        onToggleMeasure={() => setMeasureActive((v) => !v)}
+        onToggleMeasure={() => { setDrawMode(null); setMeasureActive((v) => !v) }}
         coordFormat={coordFormat}
         onToggleCoordFormat={() => setCoordFormat((f) => f === 'decimal' ? 'dms' : 'decimal')}
         measureResult={measureResult}
+        drawMode={drawMode}
+        onSetDrawMode={handleSetDrawMode}
       />
 
       <div className={styles.workspace}>
@@ -187,6 +247,10 @@ export default function App() {
           overlayVisibility={overlayVisibility}
           onToggleOverlay={handleToggleOverlay}
           onFitAll={() => setFitAllTrigger((n) => n + 1)}
+          aois={aois}
+          selectedAoiId={selectedAoiId}
+          onSelectAoi={handleSelectAoi}
+          onDeleteAoi={handleDeleteAoi}
         />
 
         <div className={styles.mapContainer}>
@@ -206,6 +270,12 @@ export default function App() {
             onMeasureResult={handleMeasureResult}
             coordFormat={coordFormat}
             onCopyCoords={handleCopyCoords}
+            aois={aois}
+            selectedAoiId={selectedAoiId}
+            onAoiClick={handleSelectAoi}
+            drawMode={drawMode}
+            onAoiComplete={handleAoiComplete}
+            onDrawCancel={() => setDrawMode(null)}
           />
         </div>
 
@@ -222,7 +292,7 @@ export default function App() {
         )}
       </div>
 
-      {pendingCoords && !measureActive && (
+      {pendingCoords && !measureActive && !drawMode && (
         <MarkerModal mode="add" coords={pendingCoords}
           onConfirm={handleAddMarker} onCancel={() => setPendingCoords(null)} />
       )}
