@@ -59,6 +59,21 @@ def init_db():
             created_at INTEGER NOT NULL
         )
     """)
+    # Stage 3 — per-AOI imagery snapshots / history.
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS aoi_imagery (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            aoi_id INTEGER NOT NULL,
+            label TEXT NOT NULL DEFAULT '',
+            source TEXT NOT NULL DEFAULT '',
+            imagery_date TEXT NOT NULL DEFAULT '',
+            state TEXT NOT NULL DEFAULT 'current',
+            notes TEXT DEFAULT '',
+            change_notes TEXT DEFAULT '',
+            created_at INTEGER NOT NULL,
+            FOREIGN KEY (aoi_id) REFERENCES aoi(id) ON DELETE CASCADE
+        )
+    """)
     conn.commit()
     conn.close()
 
@@ -366,6 +381,7 @@ def update_aoi(aoi_id: int, data: AoiUpdate):
 def delete_aoi(aoi_id: int):
     conn = get_db()
     result = conn.execute("DELETE FROM aoi WHERE id = ?", (aoi_id,))
+    conn.execute("DELETE FROM aoi_imagery WHERE aoi_id = ?", (aoi_id,))
     conn.commit()
     conn.close()
     if result.rowcount == 0:
@@ -429,3 +445,141 @@ def import_aoi_geojson(body: dict):
     conn.commit()
     conn.close()
     return {"imported": imported, "skipped": skipped}
+
+
+# ── AOI imagery snapshots / history (Stage 3) ────────────────────────────────
+
+IMAGERY_STATES = {"current", "previous"}
+DEFAULT_IMAGERY_STATE = "current"
+
+
+class ImageryCreate(BaseModel):
+    label: Optional[str] = ""
+    source: Optional[str] = ""
+    imagery_date: Optional[str] = ""
+    state: Optional[str] = DEFAULT_IMAGERY_STATE
+    notes: Optional[str] = ""
+    change_notes: Optional[str] = ""
+
+    @model_validator(mode="after")
+    def sanitize(self):
+        self.label = (self.label or "").strip()
+        self.source = (self.source or "").strip()
+        self.imagery_date = (self.imagery_date or "").strip()
+        self.notes = (self.notes or "").strip()
+        self.change_notes = (self.change_notes or "").strip()
+        if self.state not in IMAGERY_STATES:
+            self.state = DEFAULT_IMAGERY_STATE
+        return self
+
+
+class ImageryUpdate(BaseModel):
+    label: Optional[str] = None
+    source: Optional[str] = None
+    imagery_date: Optional[str] = None
+    state: Optional[str] = None
+    notes: Optional[str] = None
+    change_notes: Optional[str] = None
+
+    @model_validator(mode="after")
+    def sanitize(self):
+        if self.label is not None:
+            self.label = self.label.strip()
+        if self.source is not None:
+            self.source = self.source.strip()
+        if self.imagery_date is not None:
+            self.imagery_date = self.imagery_date.strip()
+        if self.notes is not None:
+            self.notes = self.notes.strip()
+        if self.change_notes is not None:
+            self.change_notes = self.change_notes.strip()
+        if self.state is not None and self.state not in IMAGERY_STATES:
+            self.state = DEFAULT_IMAGERY_STATE
+        return self
+
+
+def _imagery_row_to_dict(r) -> dict:
+    return {
+        "id": r["id"],
+        "aoi_id": r["aoi_id"],
+        "label": r["label"],
+        "source": r["source"],
+        "imagery_date": r["imagery_date"],
+        "state": r["state"],
+        "notes": r["notes"],
+        "change_notes": r["change_notes"],
+        "created_at": r["created_at"],
+    }
+
+
+def _aoi_exists(conn, aoi_id: int) -> bool:
+    return conn.execute("SELECT 1 FROM aoi WHERE id = ?", (aoi_id,)).fetchone() is not None
+
+
+@app.get("/api/aoi/{aoi_id}/imagery")
+def list_aoi_imagery(aoi_id: int):
+    conn = get_db()
+    if not _aoi_exists(conn, aoi_id):
+        conn.close()
+        raise HTTPException(status_code=404, detail="AOI not found")
+    rows = conn.execute(
+        "SELECT * FROM aoi_imagery WHERE aoi_id = ? ORDER BY imagery_date DESC, created_at DESC",
+        (aoi_id,),
+    ).fetchall()
+    conn.close()
+    return [_imagery_row_to_dict(r) for r in rows]
+
+
+@app.post("/api/aoi/{aoi_id}/imagery", status_code=201)
+def create_aoi_imagery(aoi_id: int, data: ImageryCreate):
+    conn = get_db()
+    if not _aoi_exists(conn, aoi_id):
+        conn.close()
+        raise HTTPException(status_code=404, detail="AOI not found")
+    now = int(time.time())
+    cur = conn.execute(
+        "INSERT INTO aoi_imagery (aoi_id, label, source, imagery_date, state, notes, change_notes, created_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        (aoi_id, data.label, data.source, data.imagery_date, data.state, data.notes, data.change_notes, now),
+    )
+    conn.commit()
+    row = conn.execute("SELECT * FROM aoi_imagery WHERE id = ?", (cur.lastrowid,)).fetchone()
+    conn.close()
+    return _imagery_row_to_dict(row)
+
+
+@app.put("/api/aoi/imagery/{imagery_id}")
+def update_aoi_imagery(imagery_id: int, data: ImageryUpdate):
+    conn = get_db()
+    row = conn.execute("SELECT * FROM aoi_imagery WHERE id = ?", (imagery_id,)).fetchone()
+    if not row:
+        conn.close()
+        raise HTTPException(status_code=404, detail="Imagery entry not found")
+
+    label = data.label if data.label is not None else row["label"]
+    source = data.source if data.source is not None else row["source"]
+    imagery_date = data.imagery_date if data.imagery_date is not None else row["imagery_date"]
+    state = data.state if data.state is not None else row["state"]
+    notes = data.notes if data.notes is not None else row["notes"]
+    change_notes = data.change_notes if data.change_notes is not None else row["change_notes"]
+
+    conn.execute(
+        "UPDATE aoi_imagery SET label = ?, source = ?, imagery_date = ?, state = ?, notes = ?, change_notes = ? "
+        "WHERE id = ?",
+        (label, source, imagery_date, state, notes, change_notes, imagery_id),
+    )
+    conn.commit()
+    updated = conn.execute("SELECT * FROM aoi_imagery WHERE id = ?", (imagery_id,)).fetchone()
+    conn.close()
+    return _imagery_row_to_dict(updated)
+
+
+@app.delete("/api/aoi/imagery/{imagery_id}", status_code=204)
+def delete_aoi_imagery(imagery_id: int):
+    conn = get_db()
+    result = conn.execute("DELETE FROM aoi_imagery WHERE id = ?", (imagery_id,))
+    conn.commit()
+    conn.close()
+    if result.rowcount == 0:
+        raise HTTPException(status_code=404, detail="Imagery entry not found")
+    return None
