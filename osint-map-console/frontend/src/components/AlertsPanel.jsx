@@ -3,9 +3,11 @@ import styles from '../styles/AlertsPanel.module.css'
 
 const STATUS_LABEL = { new: 'NEW', confirmed: 'CONFIRMED', dismissed: 'DISMISSED', uncertain: 'UNCERTAIN' }
 
-export default function AlertsPanel({ alerts = [], aois = [], onSelectAoi, onReview }) {
-  const [openId, setOpenId] = useState(null)
-  const [note, setNote] = useState('')
+export default function AlertsPanel({ alerts = [], aois = [], onSelectAoi, onReview, onCheckNow }) {
+  const [openId,   setOpenId]   = useState(null)
+  const [note,     setNote]     = useState('')
+  const [checking, setChecking] = useState(false)
+  const [checkResult, setCheckResult] = useState(null)
 
   const aoiTitle = (id) => aois.find((a) => a.id === id)?.title || `AOI #${id}`
 
@@ -15,19 +17,67 @@ export default function AlertsPanel({ alerts = [], aois = [], onSelectAoi, onRev
     setNote('')
   }
 
+  const handleCheckNow = async () => {
+    if (checking) return
+    setChecking(true)
+    setCheckResult(null)
+    try {
+      const result = await onCheckNow?.()
+      setCheckResult(result)
+    } catch (e) {
+      setCheckResult({ ok: false, error: e.message })
+    } finally {
+      setChecking(false)
+    }
+  }
+
   const newCount = alerts.filter((a) => a.status === 'new').length
 
   return (
     <div>
+      {/* ── Check Now button ── */}
+      <div className={styles.checkRow}>
+        <button
+          className={`${styles.checkBtn} ${checking ? styles.checkBusy : ''}`}
+          onClick={handleCheckNow}
+          disabled={checking}
+          title="Search Sentinel-2 STAC for new imagery on all monitored AOIs"
+        >
+          {checking ? '◌ CHECKING...' : '⟳ CHECK MONITORED AOIS NOW'}
+        </button>
+      </div>
+
+      {/* ── Check result summary ── */}
+      {checkResult && (
+        <div className={`${styles.checkResult} ${checkResult.ok === false ? styles.checkError : styles.checkOk}`}>
+          {checkResult.ok === false ? (
+            <span>✕ Error: {checkResult.error}</span>
+          ) : (
+            <span>
+              Checked {checkResult.checked} AOI{checkResult.checked !== 1 ? 's' : ''} · {' '}
+              {checkResult.new_snapshots} new snapshot{checkResult.new_snapshots !== 1 ? 's' : ''} · {' '}
+              {checkResult.new_alerts} new alert{checkResult.new_alerts !== 1 ? 's' : ''}
+              {checkResult.message ? ` — ${checkResult.message}` : ''}
+              {checkResult.errors?.length > 0 && (
+                <span className={styles.checkWarn}> · {checkResult.errors.length} error(s)</span>
+              )}
+            </span>
+          )}
+          <button className={styles.checkDismiss} onClick={() => setCheckResult(null)}>✕</button>
+        </div>
+      )}
+
+      {/* ── Alerts list ── */}
       <div className={styles.objectsHeader}>
         <span>ALERTS</span>
         <span className={styles.count}>{newCount} NEW / {alerts.length}</span>
       </div>
+
       <div className={styles.list}>
         {alerts.length === 0 ? (
           <div className={styles.empty}>
             <span>NO ALERTS</span>
-            <span className={styles.hint}>Monitor an AOI, then add imagery</span>
+            <span className={styles.hint}>Monitor an AOI, then click CHECK NOW</span>
           </div>
         ) : alerts.map((a) => (
           <div key={a.id} className={`${styles.item} ${styles['s_' + a.status]}`}>
@@ -50,9 +100,9 @@ export default function AlertsPanel({ alerts = [], aois = [], onSelectAoi, onRev
               <button className={styles.actBtn} onClick={() => { setOpenId(openId === a.id ? null : a.id); setNote('') }}>
                 {openId === a.id ? '✕ NOTE' : '✎ NOTE'}
               </button>
-              <button className={`${styles.actBtn} ${styles.confirm}`} onClick={() => submit(a, 'confirmed')}>CONFIRM</button>
+              <button className={`${styles.actBtn} ${styles.confirm}`}   onClick={() => submit(a, 'confirmed')}>CONFIRM</button>
               <button className={`${styles.actBtn} ${styles.uncertain}`} onClick={() => submit(a, 'uncertain')}>?</button>
-              <button className={`${styles.actBtn} ${styles.dismiss}`} onClick={() => submit(a, 'dismissed')}>DISMISS</button>
+              <button className={`${styles.actBtn} ${styles.dismiss}`}   onClick={() => submit(a, 'dismissed')}>DISMISS</button>
             </div>
           </div>
         ))}

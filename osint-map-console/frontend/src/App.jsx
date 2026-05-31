@@ -10,7 +10,7 @@ import {
   fetchMarkers, createMarker, updateMarker,
   deleteMarker, exportGeoJSON, importGeoJSON, checkHealth,
   fetchAois, createAoi, deleteAoi,
-  setAoiMonitored, fetchAlerts, reviewAlert,
+  setAoiMonitored, fetchAlerts, reviewAlert, triggerMonitoringCheck,
 } from './hooks/useApi.js'
 import { DEFAULT_BASEMAP } from './hooks/basemaps.js'
 import styles from './styles/App.module.css'
@@ -227,6 +227,16 @@ export default function App() {
     } catch (e) { showToast(e.message || 'Failed to review alert') }
   }, [showToast])
 
+  const handleCheckNow = useCallback(async () => {
+    const result = await triggerMonitoringCheck()
+    // Refresh alerts and imagery after a successful check
+    if (result.new_alerts > 0) {
+      fetchAlerts().then(setAlerts).catch(() => {})
+    }
+    return result
+  }, []) // eslint-disable-line
+
+
   const selectedAoi = aois.find((a) => a.id === selectedAoiId) || null
 
   // ── Copy center coords ─────────────────────────────────────────────────────
@@ -278,6 +288,7 @@ export default function App() {
           onDeleteAoi={handleDeleteAoi}
           alerts={alerts}
           onReviewAlert={handleReviewAlert}
+          onCheckNow={handleCheckNow}
         />
 
         <div className={styles.mapContainer}>

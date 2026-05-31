@@ -21,7 +21,7 @@ export default function Sidebar({
   overlayVisibility, onToggleOverlay,
   onFitAll,
   aois = [], selectedAoiId, onSelectAoi, onDeleteAoi,
-  alerts = [], onReviewAlert,
+  alerts = [], onReviewAlert, onCheckNow,
 }) {
   return (
     <div className={styles.sidebar}>
@@ -114,6 +114,7 @@ export default function Sidebar({
         aois={aois}
         onSelectAoi={onSelectAoi}
         onReview={onReviewAlert}
+        onCheckNow={onCheckNow}
       />
     </div>
   )

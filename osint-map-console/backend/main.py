@@ -729,3 +729,23 @@ def review_alert(alert_id: int, data: AlertReview):
     updated = conn.execute("SELECT * FROM alert_event WHERE id = ?", (alert_id,)).fetchone()
     conn.close()
     return _alert_row_to_dict(updated)
+
+
+# ── Stage 4.1 — Automated monitoring check ───────────────────────────────────
+
+from monitoring import run_monitoring_check
+
+
+@app.post("/api/monitoring/check-now")
+def monitoring_check_now():
+    """
+    Manually trigger a Sentinel-2 STAC metadata check for all monitored AOIs.
+    For each monitored AOI, searches for recent scenes and auto-creates
+    imagery snapshots and alert_events for any new finds.
+    Returns a summary of what was checked and created.
+    """
+    try:
+        result = run_monitoring_check(DB_PATH)
+        return {"ok": True, **result}
+    except Exception as e:
+        return {"ok": False, "error": str(e), "checked": 0, "new_snapshots": 0, "new_alerts": 0}

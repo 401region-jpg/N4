@@ -103,3 +103,55 @@
 .confirm:hover { color: var(--accent); border-color: var(--accent); }
 .uncertain:hover { color: #ffcc00; border-color: #ffcc00; }
 .dismiss:hover { color: var(--red); border-color: var(--red); }
+
+/* Stage 4.1 — CHECK NOW button + result */
+.checkRow {
+  padding: 8px 10px 6px;
+  border-bottom: 1px solid var(--border);
+}
+
+.checkBtn {
+  width: 100%;
+  background: transparent;
+  border: 1px solid var(--border-bright);
+  color: var(--accent);
+  font-family: var(--font-mono);
+  font-size: 10px;
+  letter-spacing: 1.5px;
+  padding: 6px 10px;
+  cursor: pointer;
+  transition: background 0.15s, border-color 0.15s;
+  text-align: left;
+}
+.checkBtn:hover:not(:disabled) {
+  background: var(--accent-glow);
+  border-color: var(--accent);
+}
+.checkBtn:disabled { opacity: 0.6; cursor: default; }
+.checkBusy {
+  color: var(--yellow) !important;
+  border-color: var(--yellow) !important;
+  animation: checkPulse 1.2s ease-in-out infinite;
+}
+@keyframes checkPulse { 0%,100% { opacity: 1; } 50% { opacity: 0.55; } }
+
+.checkResult {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 6px 10px;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  border-bottom: 1px solid var(--border);
+  line-height: 1.5;
+}
+.checkOk    { color: var(--green);  background: rgba(0,255,136,0.05); }
+.checkError { color: var(--red);    background: rgba(255,59,92,0.05); }
+.checkWarn  { color: var(--yellow); }
+
+.checkResult span:first-child { flex: 1; }
+.checkDismiss {
+  background: transparent; border: none; cursor: pointer;
+  color: var(--text-muted); font-size: 9px; flex-shrink: 0; padding: 0 2px;
+}
+.checkDismiss:hover { color: var(--text-primary); }

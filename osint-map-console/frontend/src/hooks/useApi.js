@@ -138,3 +138,8 @@ export async function checkHealth() {
     return false
   }
 }
+
+// ── Stage 4.1 — Monitoring check ────────────────────────────────────────────
+export async function triggerMonitoringCheck() {
+  return apiFetch('/api/monitoring/check-now', { method: 'POST' })
+}
