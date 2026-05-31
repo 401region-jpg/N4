@@ -3,6 +3,7 @@ import MapView from './components/MapView.jsx'
 import Sidebar from './components/Sidebar.jsx'
 import TopBar from './components/TopBar.jsx'
 import MarkerPanel from './components/MarkerPanel.jsx'
+import AoiPanel from './components/AoiPanel.jsx'
 import MarkerModal from './components/MarkerModal.jsx'
 import Toast from './components/Toast.jsx'
 import {
@@ -204,6 +205,8 @@ export default function App() {
     }
   }, [aois])
 
+  const selectedAoi = aois.find((a) => a.id === selectedAoiId) || null
+
   // ── Copy center coords ─────────────────────────────────────────────────────
   // Exposed via TopBar; MapView handles its own cursor coords
   // This is a simpler "copy current search/fly coords" feature
@@ -288,6 +291,16 @@ export default function App() {
             onEdit={setEditingMarker}
             onCopyCoords={handleCopyCoords}
             coordFormat={coordFormat}
+          />
+        )}
+
+        {selectedAoi && (
+          <AoiPanel
+            aoi={selectedAoi}
+            onClose={() => setSelectedAoiId(null)}
+            onLocate={handleSelectAoi}
+            onDelete={handleDeleteAoi}
+            showToast={showToast}
           />
         )}
       </div>

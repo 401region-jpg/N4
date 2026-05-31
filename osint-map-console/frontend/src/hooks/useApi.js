@@ -84,6 +84,31 @@ export async function deleteAoi(id) {
   return apiFetch(`/api/aoi/${id}`, { method: 'DELETE' })
 }
 
+// ── AOI imagery snapshots / history (Stage 3) ───────────────────────────────
+export async function fetchAoiImagery(aoiId) {
+  return apiFetch(`/api/aoi/${aoiId}/imagery`)
+}
+
+export async function createAoiImagery(aoiId, data) {
+  return apiFetch(`/api/aoi/${aoiId}/imagery`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(data),
+  })
+}
+
+export async function updateAoiImagery(imageryId, data) {
+  return apiFetch(`/api/aoi/imagery/${imageryId}`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(data),
+  })
+}
+
+export async function deleteAoiImagery(imageryId) {
+  return apiFetch(`/api/aoi/imagery/${imageryId}`, { method: 'DELETE' })
+}
+
 export async function checkHealth() {
   try {
     const res = await fetch(`${API_BASE}/health`)
