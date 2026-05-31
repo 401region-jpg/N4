@@ -10,6 +10,7 @@ import {
   fetchMarkers, createMarker, updateMarker,
   deleteMarker, exportGeoJSON, importGeoJSON, checkHealth,
   fetchAois, createAoi, deleteAoi,
+  setAoiMonitored, fetchAlerts, reviewAlert,
 } from './hooks/useApi.js'
 import { DEFAULT_BASEMAP } from './hooks/basemaps.js'
 import styles from './styles/App.module.css'
@@ -51,6 +52,7 @@ export default function App() {
   const [aois,              setAois]              = useState([])
   const [selectedAoiId,     setSelectedAoiId]     = useState(null)
   const [drawMode,          setDrawMode]          = useState(null) // 'polygon'|'route'|'circle'|null
+  const [alerts,            setAlerts]            = useState([])
   const [toasts,            setToasts]            = useState([])
   const toastIdRef   = useRef(0)
   const searchTimerRef = useRef(null)
@@ -74,6 +76,7 @@ export default function App() {
       if (ok) {
         fetchMarkers().then(setMarkers).catch(() => showToast('Failed to load markers'))
         fetchAois().then(setAois).catch(() => showToast('Failed to load AOIs'))
+        fetchAlerts().then(setAlerts).catch(() => showToast('Failed to load alerts'))
       } else {
         showToast('Backend offline — start uvicorn on port 8000')
       }
@@ -205,6 +208,25 @@ export default function App() {
     }
   }, [aois])
 
+  const refreshAlerts = useCallback(() => {
+    fetchAlerts().then(setAlerts).catch(() => {})
+  }, [])
+
+  const handleToggleMonitor = useCallback(async (aoi) => {
+    try {
+      const updated = await setAoiMonitored(aoi.id, !aoi.monitored)
+      setAois((prev) => prev.map((a) => a.id === updated.id ? updated : a))
+      showToast(updated.monitored ? `Monitoring "${updated.title}"` : `Monitoring off`, 'success')
+    } catch (e) { showToast(e.message || 'Failed to update monitoring') }
+  }, [showToast])
+
+  const handleReviewAlert = useCallback(async (id, status, note) => {
+    try {
+      const updated = await reviewAlert(id, status, note)
+      setAlerts((prev) => prev.map((a) => a.id === updated.id ? updated : a))
+    } catch (e) { showToast(e.message || 'Failed to review alert') }
+  }, [showToast])
+
   const selectedAoi = aois.find((a) => a.id === selectedAoiId) || null
 
   // ── Copy center coords ─────────────────────────────────────────────────────
@@ -254,6 +276,8 @@ export default function App() {
           selectedAoiId={selectedAoiId}
           onSelectAoi={handleSelectAoi}
           onDeleteAoi={handleDeleteAoi}
+          alerts={alerts}
+          onReviewAlert={handleReviewAlert}
         />
 
         <div className={styles.mapContainer}>
@@ -300,6 +324,8 @@ export default function App() {
             onClose={() => setSelectedAoiId(null)}
             onLocate={handleSelectAoi}
             onDelete={handleDeleteAoi}
+            onToggleMonitor={handleToggleMonitor}
+            onImageryAdded={refreshAlerts}
             showToast={showToast}
           />
         )}

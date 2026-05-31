@@ -1,4 +1,5 @@
 import styles from '../styles/Sidebar.module.css'
+import AlertsPanel from './AlertsPanel.jsx'
 
 // Countries, Cities, Grid are implemented.
 // Regions needs a global admin-1 vector source we don't have keyless; Routes/Zones land in Stage 2.
@@ -20,6 +21,7 @@ export default function Sidebar({
   overlayVisibility, onToggleOverlay,
   onFitAll,
   aois = [], selectedAoiId, onSelectAoi, onDeleteAoi,
+  alerts = [], onReviewAlert,
 }) {
   return (
     <div className={styles.sidebar}>
@@ -104,6 +106,15 @@ export default function Sidebar({
           </div>
         ))}
       </div>
+
+      <div className={styles.divider} />
+
+      <AlertsPanel
+        alerts={alerts}
+        aois={aois}
+        onSelectAoi={onSelectAoi}
+        onReview={onReviewAlert}
+      />
     </div>
   )
 }

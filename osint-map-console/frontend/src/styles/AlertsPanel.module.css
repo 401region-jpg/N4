@@ -1,0 +1,105 @@
+.objectsHeader {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 8px 14px;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  letter-spacing: 2px;
+  color: var(--accent);
+}
+.count {
+  font-size: 9px;
+  letter-spacing: 1px;
+  color: var(--text-muted);
+}
+
+.list {
+  max-height: 320px;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+
+.empty {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 14px;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  color: var(--text-muted);
+}
+.hint { font-size: 9px; opacity: 0.7; }
+
+.item {
+  padding: 8px 12px;
+  border-left: 2px solid var(--border);
+  background: var(--bg-panel);
+}
+.s_new { border-left-color: var(--red); }
+.s_confirmed { border-left-color: var(--accent); }
+.s_uncertain { border-left-color: #ffcc00; }
+.s_dismissed { border-left-color: var(--border); opacity: 0.55; }
+
+.itemMain { cursor: pointer; display: flex; flex-direction: column; gap: 3px; }
+
+.itemTop { display: flex; align-items: center; gap: 6px; }
+
+.badge {
+  font-family: var(--font-mono);
+  font-size: 8px;
+  letter-spacing: 1px;
+  padding: 1px 5px;
+  border: 1px solid var(--border);
+  color: var(--text-muted);
+}
+.b_new { color: var(--red); border-color: var(--red); }
+.b_confirmed { color: var(--accent); border-color: var(--accent); }
+.b_uncertain { color: #ffcc00; border-color: #ffcc00; }
+.b_dismissed { color: var(--text-muted); }
+
+.aoiName {
+  font-family: var(--font-mono);
+  font-size: 9px;
+  color: var(--text-muted);
+}
+.title {
+  font-size: 11px;
+  color: var(--text);
+}
+.details, .reviewNote {
+  font-family: var(--font-mono);
+  font-size: 9px;
+  color: var(--text-muted);
+}
+.reviewNote { font-style: italic; }
+
+.noteInput {
+  margin: 6px 0 4px;
+  width: 100%;
+  background: var(--bg-panel2);
+  border: 1px solid var(--border);
+  color: var(--text);
+  font-family: var(--font-mono);
+  font-size: 10px;
+  padding: 4px 6px;
+}
+
+.actions { display: flex; gap: 4px; margin-top: 6px; }
+.actBtn {
+  flex: 1;
+  font-family: var(--font-mono);
+  font-size: 8px;
+  letter-spacing: 0.5px;
+  padding: 4px 2px;
+  border: 1px solid var(--border);
+  background: transparent;
+  color: var(--text-muted);
+  transition: background 0.15s, color 0.15s, border-color 0.15s;
+}
+.actBtn:hover { color: var(--text); }
+.confirm:hover { color: var(--accent); border-color: var(--accent); }
+.uncertain:hover { color: #ffcc00; border-color: #ffcc00; }
+.dismiss:hover { color: var(--red); border-color: var(--red); }
