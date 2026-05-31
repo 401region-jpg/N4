@@ -109,6 +109,27 @@ export async function deleteAoiImagery(imageryId) {
   return apiFetch(`/api/aoi/imagery/${imageryId}`, { method: 'DELETE' })
 }
 
+// ── Monitoring + alerts (Stage 4) ───────────────────────────────────────────
+export async function setAoiMonitored(aoiId, monitored) {
+  return apiFetch(`/api/aoi/${aoiId}/monitor`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ monitored }),
+  })
+}
+
+export async function fetchAlerts() {
+  return apiFetch('/api/alerts')
+}
+
+export async function reviewAlert(alertId, status, review_note = '') {
+  return apiFetch(`/api/alerts/${alertId}/review`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ status, review_note }),
+  })
+}
+
 export async function checkHealth() {
   try {
     const res = await fetch(`${API_BASE}/health`)

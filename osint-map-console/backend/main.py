@@ -74,6 +74,24 @@ def init_db():
             FOREIGN KEY (aoi_id) REFERENCES aoi(id) ON DELETE CASCADE
         )
     """)
+    # Stage 4 — monitoring + alerts.
+    cols = [r["name"] for r in conn.execute("PRAGMA table_info(aoi)").fetchall()]
+    if "monitored" not in cols:
+        conn.execute("ALTER TABLE aoi ADD COLUMN monitored INTEGER NOT NULL DEFAULT 0")
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS alert_event (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            aoi_id INTEGER NOT NULL,
+            type TEXT NOT NULL DEFAULT 'imagery',
+            status TEXT NOT NULL DEFAULT 'new',
+            title TEXT NOT NULL DEFAULT '',
+            details TEXT DEFAULT '',
+            created_at INTEGER NOT NULL,
+            reviewed_at INTEGER,
+            review_note TEXT DEFAULT '',
+            FOREIGN KEY (aoi_id) REFERENCES aoi(id) ON DELETE CASCADE
+        )
+    """)
     conn.commit()
     conn.close()
 
@@ -327,6 +345,7 @@ def _aoi_row_to_dict(r) -> dict:
         "note": r["note"],
         "color": r["color"],
         "geometry": json.loads(r["geometry"]),
+        "monitored": bool(r["monitored"]) if "monitored" in r.keys() else False,
         "created_at": r["created_at"],
     }
 
@@ -382,6 +401,7 @@ def delete_aoi(aoi_id: int):
     conn = get_db()
     result = conn.execute("DELETE FROM aoi WHERE id = ?", (aoi_id,))
     conn.execute("DELETE FROM aoi_imagery WHERE aoi_id = ?", (aoi_id,))
+    conn.execute("DELETE FROM alert_event WHERE aoi_id = ?", (aoi_id,))
     conn.commit()
     conn.close()
     if result.rowcount == 0:
@@ -533,7 +553,8 @@ def list_aoi_imagery(aoi_id: int):
 @app.post("/api/aoi/{aoi_id}/imagery", status_code=201)
 def create_aoi_imagery(aoi_id: int, data: ImageryCreate):
     conn = get_db()
-    if not _aoi_exists(conn, aoi_id):
+    aoi_row = conn.execute("SELECT * FROM aoi WHERE id = ?", (aoi_id,)).fetchone()
+    if not aoi_row:
         conn.close()
         raise HTTPException(status_code=404, detail="AOI not found")
     now = int(time.time())
@@ -542,6 +563,17 @@ def create_aoi_imagery(aoi_id: int, data: ImageryCreate):
         "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
         (aoi_id, data.label, data.source, data.imagery_date, data.state, data.notes, data.change_notes, now),
     )
+    # Stage 4 — closing the loop: new imagery on a monitored AOI raises an alert.
+    if aoi_row["monitored"]:
+        snap = data.label or data.source or "snapshot"
+        detail = f"New imagery snapshot on monitored AOI: {snap}"
+        if data.imagery_date:
+            detail += f" ({data.imagery_date})"
+        conn.execute(
+            "INSERT INTO alert_event (aoi_id, type, status, title, details, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (aoi_id, "imagery", "new", f"Imagery update — {aoi_row['title']}", detail, now),
+        )
     conn.commit()
     row = conn.execute("SELECT * FROM aoi_imagery WHERE id = ?", (cur.lastrowid,)).fetchone()
     conn.close()
@@ -583,3 +615,117 @@ def delete_aoi_imagery(imagery_id: int):
     if result.rowcount == 0:
         raise HTTPException(status_code=404, detail="Imagery entry not found")
     return None
+
+
+# ── Monitoring + alerts (Stage 4) ────────────────────────────────────────────
+
+ALERT_STATUSES = {"new", "confirmed", "dismissed", "uncertain"}
+
+
+class MonitorToggle(BaseModel):
+    monitored: bool
+
+
+class AlertCreate(BaseModel):
+    aoi_id: int
+    type: Optional[str] = "manual"
+    title: Optional[str] = ""
+    details: Optional[str] = ""
+
+    @model_validator(mode="after")
+    def sanitize(self):
+        self.type = (self.type or "manual").strip() or "manual"
+        self.title = (self.title or "").strip()
+        self.details = (self.details or "").strip()
+        return self
+
+
+class AlertReview(BaseModel):
+    status: str
+    review_note: Optional[str] = ""
+
+    @model_validator(mode="after")
+    def sanitize(self):
+        if self.status not in ALERT_STATUSES:
+            raise ValueError(f"status must be one of {sorted(ALERT_STATUSES)}")
+        self.review_note = (self.review_note or "").strip()
+        return self
+
+
+def _alert_row_to_dict(r) -> dict:
+    return {
+        "id": r["id"],
+        "aoi_id": r["aoi_id"],
+        "type": r["type"],
+        "status": r["status"],
+        "title": r["title"],
+        "details": r["details"],
+        "created_at": r["created_at"],
+        "reviewed_at": r["reviewed_at"],
+        "review_note": r["review_note"],
+    }
+
+
+@app.put("/api/aoi/{aoi_id}/monitor")
+def set_aoi_monitored(aoi_id: int, data: MonitorToggle):
+    conn = get_db()
+    if not _aoi_exists(conn, aoi_id):
+        conn.close()
+        raise HTTPException(status_code=404, detail="AOI not found")
+    conn.execute("UPDATE aoi SET monitored = ? WHERE id = ?", (1 if data.monitored else 0, aoi_id))
+    conn.commit()
+    row = conn.execute("SELECT * FROM aoi WHERE id = ?", (aoi_id,)).fetchone()
+    conn.close()
+    return _aoi_row_to_dict(row)
+
+
+@app.get("/api/aoi/monitored")
+def list_monitored_aoi():
+    conn = get_db()
+    rows = conn.execute("SELECT * FROM aoi WHERE monitored = 1 ORDER BY created_at DESC").fetchall()
+    conn.close()
+    return [_aoi_row_to_dict(r) for r in rows]
+
+
+@app.get("/api/alerts")
+def list_alerts():
+    conn = get_db()
+    rows = conn.execute("SELECT * FROM alert_event ORDER BY created_at DESC").fetchall()
+    conn.close()
+    return [_alert_row_to_dict(r) for r in rows]
+
+
+@app.post("/api/alerts", status_code=201)
+def create_alert(data: AlertCreate):
+    conn = get_db()
+    if not _aoi_exists(conn, data.aoi_id):
+        conn.close()
+        raise HTTPException(status_code=404, detail="AOI not found")
+    now = int(time.time())
+    cur = conn.execute(
+        "INSERT INTO alert_event (aoi_id, type, status, title, details, created_at) "
+        "VALUES (?, ?, 'new', ?, ?, ?)",
+        (data.aoi_id, data.type, data.title or "Alert", data.details, now),
+    )
+    conn.commit()
+    row = conn.execute("SELECT * FROM alert_event WHERE id = ?", (cur.lastrowid,)).fetchone()
+    conn.close()
+    return _alert_row_to_dict(row)
+
+
+@app.put("/api/alerts/{alert_id}/review")
+def review_alert(alert_id: int, data: AlertReview):
+    conn = get_db()
+    row = conn.execute("SELECT * FROM alert_event WHERE id = ?", (alert_id,)).fetchone()
+    if not row:
+        conn.close()
+        raise HTTPException(status_code=404, detail="Alert not found")
+    now = int(time.time())
+    conn.execute(
+        "UPDATE alert_event SET status = ?, review_note = ?, reviewed_at = ? WHERE id = ?",
+        (data.status, data.review_note, now, alert_id),
+    )
+    conn.commit()
+    updated = conn.execute("SELECT * FROM alert_event WHERE id = ?", (alert_id,)).fetchone()
+    conn.close()
+    return _alert_row_to_dict(updated)

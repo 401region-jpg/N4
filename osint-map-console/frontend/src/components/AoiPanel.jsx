@@ -12,7 +12,7 @@ function formatTimestamp(ts) {
   return new Date(ts * 1000).toISOString().replace('T', ' ').slice(0, 16) + ' UTC'
 }
 
-export default function AoiPanel({ aoi, onClose, onLocate, onDelete, showToast }) {
+export default function AoiPanel({ aoi, onClose, onLocate, onDelete, onToggleMonitor, onImageryAdded, showToast }) {
   const [imagery, setImagery]   = useState([])
   const [loading, setLoading]   = useState(false)
   const [adding, setAdding]     = useState(false)
@@ -42,8 +42,9 @@ export default function AoiPanel({ aoi, onClose, onLocate, onDelete, showToast }
       setAdding(false)
       setForm(BLANK)
       showToast?.('Imagery snapshot added', 'success')
+      if (aoi.monitored) onImageryAdded?.()
     } catch (err) { showToast?.(err.message || 'Failed to add imagery') }
-  }, [aoi, form, showToast])
+  }, [aoi, form, showToast, onImageryAdded])
 
   const handleSetState = useCallback(async (entry, state) => {
     try {
@@ -87,6 +88,20 @@ export default function AoiPanel({ aoi, onClose, onLocate, onDelete, showToast }
           <span className={styles.fieldLabel}>TITLE</span>
           <span className={styles.fieldValue}>{aoi.title}</span>
           <span className={styles.fieldSub}>{(aoi.kind || 'aoi').toUpperCase()}</span>
+        </div>
+
+        <div className={styles.monitorRow}>
+          <div>
+            <span className={styles.fieldLabel}>MONITORING</span>
+            <span className={styles.monitorHint}>
+              {aoi.monitored ? 'New imagery raises alerts' : 'Off — no alerts'}
+            </span>
+          </div>
+          <button
+            className={`${styles.monitorBtn} ${aoi.monitored ? styles.monitorOn : ''}`}
+            onClick={() => onToggleMonitor?.(aoi)}>
+            {aoi.monitored ? '◉ MONITORED' : '○ MONITOR'}
+          </button>
         </div>
 
         <div className={styles.section}>
