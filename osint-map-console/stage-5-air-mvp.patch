@@ -1,0 +1,1042 @@
+From 3c4e1180492761c9f66f7b4741205c7ce3c18d3c Mon Sep 17 00:00:00 2001
+From: OSINT Map Stage 5 <stage5@osint-map-console.local>
+Date: Mon, 1 Jun 2026 05:28:24 +0000
+Subject: [PATCH] =?UTF-8?q?feat:=20Stage=205=20MVP=20=E2=80=94=20aircraft?=
+ =?UTF-8?q?=20activity=20overlay=20with=20AOI=20intersection?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Source: OpenSky Network public REST API (no auth required for anonymous use)
+Pattern: manual-triggered refresh (mirrors Stage 4.1), no background workers.
+
+Backend:
+- air_traffic.py: new module
+  - _normalize(): maps OpenSky state vector to internal aircraft dict
+    {icao24, callsign, country, lat, lng, alt_m, speed_ms, heading, on_ground}
+  - fetch_aircraft(): GET opensky-network.org/api/states/all with optional bbox
+    returns only airborne (on_ground=false) aircraft
+  - store_snapshot() / load_latest_snapshot(): sqlite air_snapshot table
+    keeps last 3 snapshots (MAX_STORED), auto-prunes old rows
+  - intersect_with_aoi(): bbox check with 0.5° pad for each monitored AOI
+- main.py: 3 new endpoints
+  POST /api/air/refresh      — fetch from OpenSky, store snapshot, return aircraft
+  GET  /api/air/latest       — return last stored snapshot (no new fetch)
+  GET  /api/air/near-aois    — return aircraft intersecting each monitored AOI
+  DB init: air_snapshot table created on startup
+
+Frontend:
+- airLayer.js: MapLibre layer management
+  - circle layer colored by altitude band (yellow <3km / cyan <9km / white high)
+  - symbol label layer at zoom >= 6 (auto-declutter at low zoom)
+  - ensureAirLayers / setAirData / setAirVisibility / AIR_CLICKABLE_LAYERS
+- AircraftPanel.jsx: sidebar panel
+  - REFRESH AIRCRAFT NOW button (mirrors CHECK NOW from Stage 4.1)
+  - snapshot summary: total airborne count
+  - alert banner: count near monitored AOIs
+  - collapsible AOI groups showing aircraft within 0.5° radius
+  - selected aircraft detail: ICAO24, callsign, country, alt, speed, heading, pos
+- AircraftPanel.module.css: dark operational styling
+- MapView.jsx: aircraft layer init on load, data/visibility effects
+- Sidebar.jsx: AIR ACTIVITY toggle in layer list, AircraftPanel at bottom
+- App.jsx: air state (airSnapshot, airNearAois, airVisible), handleAirRefresh,
+  handleAircraftClick, props threaded to MapView + Sidebar
+- useApi.js: refreshAirTraffic(), fetchAirLatest(), fetchAirNearAois()
+
+Build: npm run build ✓ (59 modules, 0 errors)
+---
+ osint-map-console/backend/air_traffic.py      | 202 ++++++++++++++++++
+ osint-map-console/backend/main.py             |  96 +++++++++
+ osint-map-console/frontend/src/App.jsx        |  40 ++++
+ .../frontend/src/components/AircraftPanel.jsx | 172 +++++++++++++++
+ .../frontend/src/components/MapView.jsx       |  43 ++++
+ .../frontend/src/components/Sidebar.jsx       |  15 +-
+ .../frontend/src/hooks/airLayer.js            |  98 +++++++++
+ .../frontend/src/hooks/useApi.js              |  13 ++
+ .../src/styles/AircraftPanel.module.css       | 121 +++++++++++
+ 9 files changed, 798 insertions(+), 2 deletions(-)
+ create mode 100644 osint-map-console/backend/air_traffic.py
+ create mode 100644 osint-map-console/frontend/src/components/AircraftPanel.jsx
+ create mode 100644 osint-map-console/frontend/src/hooks/airLayer.js
+ create mode 100644 osint-map-console/frontend/src/styles/AircraftPanel.module.css
+
+diff --git a/osint-map-console/backend/air_traffic.py b/osint-map-console/backend/air_traffic.py
+new file mode 100644
+index 0000000..b0f4b97
+--- /dev/null
++++ b/osint-map-console/backend/air_traffic.py
+@@ -0,0 +1,202 @@
++"""
++Stage 5 — Air traffic ingestion helper.
++
++Source: OpenSky Network REST API (public, no auth for anonymous use)
++  https://opensky-network.org/api/states/all
++  Returns all aircraft currently tracked worldwide.
++  Anonymous: max 400 states, 10 s resolution, rate-limited to ~100 req/day.
++
++We follow the same manual-triggered pattern as Stage 4.1 (no background thread).
++Backend stores the latest snapshot in-memory (last_fetch_result) AND in SQLite
++so it survives uvicorn --reload.
++
++The ingest stores aircraft as a lightweight JSON blob per refresh, keyed by
++fetch timestamp. We keep only the last N snapshots to stay lean.
++"""
++
++import json
++import time
++from typing import Optional
++
++import httpx
++
++OPENSKY_URL = "https://opensky-network.org/api/states/all"
++TIMEOUT     = 20   # seconds
++MAX_STORED  = 3    # keep last N snapshots in DB (prevents unbounded growth)
++
++# Column indices from OpenSky response
++# https://openskynetwork.github.io/opensky-api/rest.html#response
++_F_ICAO24    = 0
++_F_CALLSIGN  = 1
++_F_COUNTRY   = 2
++_F_LON       = 5
++_F_LAT       = 6
++_F_ALT_BARO  = 7    # barometric altitude (m)
++_F_ON_GROUND = 8
++_F_VELOCITY  = 9    # m/s
++_F_HEADING   = 10
++_F_ALT_GEO   = 13   # geometric altitude (m)
++
++
++def _normalize(sv: list) -> Optional[dict]:
++    """Convert one OpenSky state vector to our internal aircraft dict."""
++    try:
++        lng = sv[_F_LON]
++        lat = sv[_F_LAT]
++        if lng is None or lat is None:
++            return None
++        if not (-180 <= lng <= 180) or not (-90 <= lat <= 90):
++            return None
++
++        on_ground = bool(sv[_F_ON_GROUND])
++        alt = sv[_F_ALT_GEO] or sv[_F_ALT_BARO]
++
++        return {
++            "icao24":   (sv[_F_ICAO24] or "").strip().upper(),
++            "callsign": (sv[_F_CALLSIGN] or "").strip(),
++            "country":  (sv[_F_COUNTRY] or "").strip(),
++            "lat":      round(lat, 5),
++            "lng":      round(lng, 5),
++            "alt_m":    round(alt, 0) if alt is not None else None,
++            "speed_ms": round(sv[_F_VELOCITY], 1) if sv[_F_VELOCITY] is not None else None,
++            "heading":  round(sv[_F_HEADING], 1) if sv[_F_HEADING] is not None else None,
++            "on_ground": on_ground,
++        }
++    except Exception:
++        return None
++
++
++def fetch_aircraft(bbox: Optional[list] = None) -> dict:
++    """
++    Fetch current aircraft state from OpenSky.
++    bbox = [min_lng, min_lat, max_lng, max_lat] — optional spatial filter.
++    Returns {"ok": bool, "ts": int, "count": int, "aircraft": [...], "error": str|None}
++    """
++    params = {}
++    if bbox:
++        # OpenSky uses (lamin, lomin, lamax, lomax)
++        params = {
++            "lamin": bbox[1],
++            "lomin": bbox[0],
++            "lamax": bbox[3],
++            "lomax": bbox[2],
++        }
++
++    try:
++        resp = httpx.get(OPENSKY_URL, params=params, timeout=TIMEOUT,
++                         headers={"Accept": "application/json"})
++        resp.raise_for_status()
++        data = resp.json()
++    except httpx.TimeoutException:
++        return {"ok": False, "error": "OpenSky request timed out", "ts": int(time.time()),
++                "count": 0, "aircraft": []}
++    except httpx.HTTPStatusError as e:
++        return {"ok": False, "error": f"OpenSky HTTP {e.response.status_code}",
++                "ts": int(time.time()), "count": 0, "aircraft": []}
++    except Exception as e:
++        return {"ok": False, "error": str(e), "ts": int(time.time()),
++                "count": 0, "aircraft": []}
++
++    states = data.get("states") or []
++    aircraft = [a for sv in states if (a := _normalize(sv)) is not None]
++    # Filter airborne only (skip ground vehicles)
++    aircraft = [a for a in aircraft if not a["on_ground"]]
++
++    return {
++        "ok":       True,
++        "error":    None,
++        "ts":       int(time.time()),
++        "count":    len(aircraft),
++        "aircraft": aircraft,
++    }
++
++
++def store_snapshot(conn, result: dict) -> None:
++    """Persist snapshot to air_snapshot table; prune old ones."""
++    payload = json.dumps(result["aircraft"])
++    conn.execute(
++        "INSERT INTO air_snapshot (fetched_at, aircraft_count, payload) VALUES (?, ?, ?)",
++        (result["ts"], result["count"], payload),
++    )
++    # Keep only last MAX_STORED rows
++    conn.execute("""
++        DELETE FROM air_snapshot
++        WHERE id NOT IN (
++            SELECT id FROM air_snapshot ORDER BY fetched_at DESC LIMIT ?
++        )
++    """, (MAX_STORED,))
++    conn.commit()
++
++
++def load_latest_snapshot(conn) -> Optional[dict]:
++    """Load the most recent snapshot from DB."""
++    row = conn.execute(
++        "SELECT fetched_at, aircraft_count, payload FROM air_snapshot ORDER BY fetched_at DESC LIMIT 1"
++    ).fetchone()
++    if not row:
++        return None
++    try:
++        aircraft = json.loads(row["payload"])
++        return {"ts": row["fetched_at"], "count": row["aircraft_count"], "aircraft": aircraft}
++    except Exception:
++        return None
++
++
++def intersect_with_aoi(aircraft: list, aoi_list: list) -> list:
++    """
++    For each monitored AOI, find aircraft within a rough radius.
++    Returns list of {aoi_id, aoi_title, aircraft: [...]}.
++    Uses simple bounding-box check (fast, good enough for MVP).
++    """
++    results = []
++    for aoi in aoi_list:
++        if not aoi.get("monitored"):
++            continue
++        geom = aoi.get("geometry", {})
++        bbox = _bbox_from_geometry(geom)
++        if not bbox:
++            continue
++        # Pad bbox by ~0.5 deg (~55 km) for "near AOI"
++        pad = 0.5
++        min_lng, min_lat, max_lng, max_lat = (
++            bbox[0] - pad, bbox[1] - pad, bbox[2] + pad, bbox[3] + pad
++        )
++        near = [
++            a for a in aircraft
++            if min_lng <= a["lng"] <= max_lng and min_lat <= a["lat"] <= max_lat
++        ]
++        if near:
++            results.append({
++                "aoi_id":    aoi["id"],
++                "aoi_title": aoi["title"],
++                "count":     len(near),
++                "aircraft":  near,
++            })
++    return results
++
++
++def _bbox_from_geometry(geom: dict) -> Optional[list]:
++    """Minimal bbox helper (same logic as monitoring.py)."""
++    gtype = geom.get("type", "")
++    coords = geom.get("coordinates", [])
++
++    def flat(c):
++        if not c:
++            return []
++        if isinstance(c[0], (int, float)):
++            return [c]
++        pts = []
++        for s in c:
++            pts.extend(flat(s))
++        return pts
++
++    if gtype == "Point":
++        pts = [coords]
++    else:
++        pts = flat(coords)
++
++    if not pts:
++        return None
++    lngs = [p[0] for p in pts]
++    lats  = [p[1] for p in pts]
++    return [min(lngs), min(lats), max(lngs), max(lats)]
+diff --git a/osint-map-console/backend/main.py b/osint-map-console/backend/main.py
+index a167e41..23a603a 100644
+--- a/osint-map-console/backend/main.py
++++ b/osint-map-console/backend/main.py
+@@ -749,3 +749,99 @@ def monitoring_check_now():
+         return {"ok": True, **result}
+     except Exception as e:
+         return {"ok": False, "error": str(e), "checked": 0, "new_snapshots": 0, "new_alerts": 0}
++
++
++# ── Stage 5 — Air traffic overlay ────────────────────────────────────────────
++
++from air_traffic import fetch_aircraft, store_snapshot, load_latest_snapshot, intersect_with_aoi
++
++
++def _init_air_db(conn):
++    conn.execute("""
++        CREATE TABLE IF NOT EXISTS air_snapshot (
++            id           INTEGER PRIMARY KEY AUTOINCREMENT,
++            fetched_at   INTEGER NOT NULL,
++            aircraft_count INTEGER NOT NULL DEFAULT 0,
++            payload      TEXT NOT NULL DEFAULT '[]'
++        )
++    """)
++    conn.commit()
++
++
++# Init air table alongside markers
++_db_conn_for_init = get_db()
++_init_air_db(_db_conn_for_init)
++_db_conn_for_init.close()
++
++
++@app.post("/api/air/refresh")
++def air_refresh():
++    """
++    Manually trigger a full global aircraft fetch from OpenSky.
++    Stores snapshot in DB, returns aircraft list + metadata.
++    """
++    result = fetch_aircraft()           # no bbox → worldwide
++    conn = get_db()
++    if result["ok"] and result["aircraft"]:
++        store_snapshot(conn, result)
++    conn.close()
++    return {
++        "ok":       result["ok"],
++        "error":    result.get("error"),
++        "ts":       result["ts"],
++        "count":    result["count"],
++        "aircraft": result["aircraft"],
++    }
++
++
++@app.get("/api/air/latest")
++def air_latest():
++    """
++    Return the most recently fetched aircraft snapshot (from DB).
++    Does NOT make a new request to OpenSky.
++    """
++    conn = get_db()
++    snapshot = load_latest_snapshot(conn)
++    conn.close()
++    if not snapshot:
++        return {"ok": False, "ts": None, "count": 0, "aircraft": [],
++                "message": "No snapshot yet — call POST /api/air/refresh first"}
++    return {"ok": True, "ts": snapshot["ts"], "count": snapshot["count"],
++            "aircraft": snapshot["aircraft"]}
++
++
++@app.get("/api/air/near-aois")
++def air_near_aois():
++    """
++    Return aircraft that are currently near/inside each monitored AOI.
++    Uses the latest stored snapshot. Does NOT re-fetch from OpenSky.
++    """
++    conn = get_db()
++    snapshot = load_latest_snapshot(conn)
++    aoi_rows = conn.execute("SELECT * FROM aoi WHERE monitored = 1").fetchall()
++    conn.close()
++
++    if not snapshot:
++        return {"ok": False, "ts": None, "results": [],
++                "message": "No snapshot yet — call POST /api/air/refresh first"}
++
++    aoi_list = []
++    for r in aoi_rows:
++        import json as _json
++        try:
++            geom = _json.loads(r["geometry"])
++        except Exception:
++            continue
++        aoi_list.append({
++            "id":        r["id"],
++            "title":     r["title"],
++            "monitored": bool(r["monitored"]),
++            "geometry":  geom,
++        })
++
++    results = intersect_with_aoi(snapshot["aircraft"], aoi_list)
++    return {
++        "ok":      True,
++        "ts":      snapshot["ts"],
++        "results": results,
++    }
+diff --git a/osint-map-console/frontend/src/App.jsx b/osint-map-console/frontend/src/App.jsx
+index 35b0256..7c5f373 100644
+--- a/osint-map-console/frontend/src/App.jsx
++++ b/osint-map-console/frontend/src/App.jsx
+@@ -4,6 +4,7 @@ import Sidebar from './components/Sidebar.jsx'
+ import TopBar from './components/TopBar.jsx'
+ import MarkerPanel from './components/MarkerPanel.jsx'
+ import AoiPanel from './components/AoiPanel.jsx'
++import AircraftPanel from './components/AircraftPanel.jsx'
+ import MarkerModal from './components/MarkerModal.jsx'
+ import Toast from './components/Toast.jsx'
+ import {
+@@ -11,6 +12,7 @@ import {
+   deleteMarker, exportGeoJSON, importGeoJSON, checkHealth,
+   fetchAois, createAoi, deleteAoi,
+   setAoiMonitored, fetchAlerts, reviewAlert, triggerMonitoringCheck,
++  refreshAirTraffic, fetchAirLatest, fetchAirNearAois,
+ } from './hooks/useApi.js'
+ import { DEFAULT_BASEMAP } from './hooks/basemaps.js'
+ import styles from './styles/App.module.css'
+@@ -21,6 +23,8 @@ const INIT_OVERLAY = {
+   grid:      false,
+ }
+ 
++// Air layer visibility is separate (handled via airVisible state, not overlayVisibility)
++
+ // Rough centroid of an AOI geometry for fly-to.
+ function aoiCentroid(geom) {
+   if (!geom) return null
+@@ -53,6 +57,11 @@ export default function App() {
+   const [selectedAoiId,     setSelectedAoiId]     = useState(null)
+   const [drawMode,          setDrawMode]          = useState(null) // 'polygon'|'route'|'circle'|null
+   const [alerts,            setAlerts]            = useState([])
++  // Stage 5 — Air traffic
++  const [airSnapshot,       setAirSnapshot]       = useState(null)    // {ts, count, aircraft}
++  const [airNearAois,       setAirNearAois]       = useState([])
++  const [airVisible,        setAirVisible]        = useState(true)
++  const [selectedAircraft,  setSelectedAircraft]  = useState(null)
+   const [toasts,            setToasts]            = useState([])
+   const toastIdRef   = useRef(0)
+   const searchTimerRef = useRef(null)
+@@ -237,6 +246,27 @@ export default function App() {
+   }, []) // eslint-disable-line
+ 
+ 
++  // ── Stage 5: Air traffic ─────────────────────────────────────────────────────
++  const handleAirRefresh = useCallback(async () => {
++    try {
++      const result = await refreshAirTraffic()
++      if (result.ok) {
++        setAirSnapshot({ ts: result.ts, count: result.count, aircraft: result.aircraft })
++        // Immediately check near AOIs
++        const near = await fetchAirNearAois()
++        if (near.ok) setAirNearAois(near.results || [])
++        if (result.count > 0) showToast(`${result.count} aircraft loaded`, 'info')
++      } else {
++        showToast(`Air refresh failed: ${result.error}`, 'error')
++      }
++    } catch (e) { showToast(e.message || 'Air refresh failed') }
++  }, [showToast])
++
++  const handleAircraftClick = useCallback((props) => {
++    setSelectedAircraft((prev) => prev?.icao24 === props?.icao24 ? null : props)
++  }, [])
++
++
+   const selectedAoi = aois.find((a) => a.id === selectedAoiId) || null
+ 
+   // ── Copy center coords ─────────────────────────────────────────────────────
+@@ -289,6 +319,13 @@ export default function App() {
+           alerts={alerts}
+           onReviewAlert={handleReviewAlert}
+           onCheckNow={handleCheckNow}
++          airVisible={airVisible}
++          onToggleAir={() => setAirVisible((v) => !v)}
++          airSnapshot={airSnapshot}
++          airNearAois={airNearAois}
++          onAirRefresh={handleAirRefresh}
++          onAircraftClick={handleAircraftClick}
++          selectedAircraft={selectedAircraft}
+         />
+ 
+         <div className={styles.mapContainer}>
+@@ -314,6 +351,9 @@ export default function App() {
+             drawMode={drawMode}
+             onAoiComplete={handleAoiComplete}
+             onDrawCancel={() => setDrawMode(null)}
++            aircraft={airSnapshot?.aircraft || []}
++            airVisible={airVisible}
++            onAircraftClick={handleAircraftClick}
+           />
+         </div>
+ 
+diff --git a/osint-map-console/frontend/src/components/AircraftPanel.jsx b/osint-map-console/frontend/src/components/AircraftPanel.jsx
+new file mode 100644
+index 0000000..de58631
+--- /dev/null
++++ b/osint-map-console/frontend/src/components/AircraftPanel.jsx
+@@ -0,0 +1,172 @@
++// Stage 5 — Aircraft activity panel
++// Shows: refresh button, last fetch summary, aircraft near monitored AOIs
++import { useState, useCallback } from 'react'
++import styles from '../styles/AircraftPanel.module.css'
++
++function formatAlt(m) {
++  if (m == null) return '—'
++  return m >= 1000 ? `${(m / 1000).toFixed(1)} km` : `${Math.round(m)} m`
++}
++
++function formatSpeed(ms) {
++  if (ms == null) return '—'
++  return `${Math.round(ms * 3.6)} km/h`
++}
++
++function formatHeading(h) {
++  if (h == null) return '—'
++  const dirs = ['N','NE','E','SE','S','SW','W','NW']
++  return dirs[Math.round(h / 45) % 8] + ` ${Math.round(h)}°`
++}
++
++function formatAge(ts) {
++  if (!ts) return 'never'
++  const sec = Math.round(Date.now() / 1000 - ts)
++  if (sec < 60)   return `${sec}s ago`
++  if (sec < 3600) return `${Math.floor(sec/60)}m ago`
++  return `${Math.floor(sec/3600)}h ago`
++}
++
++export default function AircraftPanel({
++  snapshot,      // { ts, count, aircraft: [] } | null
++  nearAois,      // [{ aoi_id, aoi_title, count, aircraft: [] }]
++  onRefresh,     // async () => void
++  onAircraftClick, // (aircraft) => void
++}) {
++  const [refreshing,  setRefreshing]  = useState(false)
++  const [expandedAoi, setExpandedAoi] = useState(null)
++  const [selectedAc,  setSelectedAc]  = useState(null)
++
++  const handleRefresh = useCallback(async () => {
++    if (refreshing) return
++    setRefreshing(true)
++    try { await onRefresh?.() }
++    finally { setRefreshing(false) }
++  }, [refreshing, onRefresh])
++
++  const totalNear = nearAois?.reduce((s, r) => s + r.count, 0) ?? 0
++
++  return (
++    <div className={styles.panel}>
++      {/* Header */}
++      <div className={styles.header}>
++        <span className={styles.headerIcon}>✈</span>
++        <span className={styles.headerLabel}>AIR ACTIVITY</span>
++        {snapshot && (
++          <span className={styles.headerAge}>{formatAge(snapshot.ts)}</span>
++        )}
++      </div>
++
++      {/* Refresh button */}
++      <div className={styles.refreshRow}>
++        <button
++          className={`${styles.refreshBtn} ${refreshing ? styles.refreshBusy : ''}`}
++          onClick={handleRefresh}
++          disabled={refreshing}
++          title="Fetch current aircraft from OpenSky Network"
++        >
++          {refreshing ? '◌ FETCHING...' : '⟳ REFRESH AIRCRAFT NOW'}
++        </button>
++      </div>
++
++      {/* Snapshot summary */}
++      {snapshot && (
++        <div className={styles.summary}>
++          <span className={styles.summaryCount}>{snapshot.count}</span>
++          <span className={styles.summaryLabel}>airborne tracked</span>
++          {totalNear > 0 && (
++            <span className={styles.summaryAlert}>
++              ⚑ {totalNear} near monitored AOIs
++            </span>
++          )}
++        </div>
++      )}
++
++      {!snapshot && (
++        <div className={styles.empty}>
++          <span>NO DATA</span>
++          <span className={styles.emptyHint}>Click REFRESH to fetch aircraft</span>
++        </div>
++      )}
++
++      {/* Aircraft near monitored AOIs */}
++      {nearAois && nearAois.length > 0 && (
++        <>
++          <div className={styles.sectionHeader}>
++            <span>NEAR MONITORED AOIs</span>
++            <span className={styles.sectionCount}>{totalNear}</span>
++          </div>
++          <div className={styles.aoiList}>
++            {nearAois.map((r) => (
++              <div key={r.aoi_id} className={styles.aoiGroup}>
++                <div
++                  className={styles.aoiRow}
++                  onClick={() => setExpandedAoi(expandedAoi === r.aoi_id ? null : r.aoi_id)}
++                >
++                  <span className={styles.aoiTitle}>{r.aoi_title}</span>
++                  <span className={styles.aoiCount}>{r.count} ac</span>
++                  <span className={styles.expandIcon}>{expandedAoi === r.aoi_id ? '▲' : '▼'}</span>
++                </div>
++                {expandedAoi === r.aoi_id && (
++                  <div className={styles.acList}>
++                    {r.aircraft.map((ac) => (
++                      <AircraftRow
++                        key={ac.icao24}
++                        ac={ac}
++                        selected={selectedAc === ac.icao24}
++                        onClick={() => {
++                          setSelectedAc(ac.icao24 === selectedAc ? null : ac.icao24)
++                          onAircraftClick?.(ac)
++                        }}
++                      />
++                    ))}
++                  </div>
++                )}
++              </div>
++            ))}
++          </div>
++        </>
++      )}
++
++      {/* Selected aircraft detail */}
++      {selectedAc && (() => {
++        const ac = nearAois?.flatMap(r => r.aircraft).find(a => a.icao24 === selectedAc)
++          || snapshot?.aircraft?.find(a => a.icao24 === selectedAc)
++        if (!ac) return null
++        return (
++          <div className={styles.detail}>
++            <div className={styles.detailHeader}>
++              <span className={styles.detailCall}>{ac.callsign || ac.icao24}</span>
++              <button className={styles.detailClose} onClick={() => setSelectedAc(null)}>✕</button>
++            </div>
++            <div className={styles.detailGrid}>
++              <span className={styles.dk}>ICAO24</span><span className={styles.dv}>{ac.icao24}</span>
++              <span className={styles.dk}>CALLSIGN</span><span className={styles.dv}>{ac.callsign || '—'}</span>
++              <span className={styles.dk}>COUNTRY</span><span className={styles.dv}>{ac.country || '—'}</span>
++              <span className={styles.dk}>ALT</span><span className={styles.dv}>{formatAlt(ac.alt_m)}</span>
++              <span className={styles.dk}>SPEED</span><span className={styles.dv}>{formatSpeed(ac.speed_ms)}</span>
++              <span className={styles.dk}>HEADING</span><span className={styles.dv}>{formatHeading(ac.heading)}</span>
++              <span className={styles.dk}>POS</span>
++              <span className={styles.dv}>{ac.lat.toFixed(4)}, {ac.lng.toFixed(4)}</span>
++            </div>
++          </div>
++        )
++      })()}
++    </div>
++  )
++}
++
++function AircraftRow({ ac, selected, onClick }) {
++  return (
++    <div
++      className={`${styles.acRow} ${selected ? styles.acSelected : ''}`}
++      onClick={onClick}
++    >
++      <span className={styles.acCall}>{ac.callsign || ac.icao24}</span>
++      <span className={styles.acDetail}>
++        {ac.alt_m != null ? `${Math.round(ac.alt_m / 100) * 100}m` : ''}
++        {ac.heading != null ? ` ${Math.round(ac.heading)}°` : ''}
++      </span>
++    </div>
++  )
++}
+diff --git a/osint-map-console/frontend/src/components/MapView.jsx b/osint-map-console/frontend/src/components/MapView.jsx
+index d00c03b..a549fdf 100644
+--- a/osint-map-console/frontend/src/components/MapView.jsx
++++ b/osint-map-console/frontend/src/components/MapView.jsx
+@@ -13,6 +13,9 @@ import {
+   ensureAoiLayers, setAoiData, clearDraft, DRAFT_SOURCE,
+   circleToPolygon, ringAreaMeters, formatArea, lineLengthMeters,
+ } from '../hooks/aoiLayer.js'
++import {
++  ensureAirLayers, setAirData, setAirVisibility, AIR_CLICKABLE_LAYERS,
++} from '../hooks/airLayer.js'
+ import styles from './MapView.module.css'
+ 
+ const DEFAULT_CENTER = [0, 20]
+@@ -51,6 +54,9 @@ export default function MapView({
+   drawMode,             // 'polygon' | 'route' | 'circle' | null
+   onAoiComplete,        // (geometry, { kind, metric }) => void
+   onDrawCancel,         // () => void
++  aircraft,             // [] — Stage 5 air layer data
++  airVisible,           // bool
++  onAircraftClick,      // (props) => void
+ }) {
+   const containerRef   = useRef(null)
+   const gridCanvasRef  = useRef(null)
+@@ -80,6 +86,11 @@ export default function MapView({
+   // Measure state (lives in refs to avoid re-render on every mousemove)
+   const measureRef = useRef({ active: false, pointA: null, line: null, popup: null })
+ 
++  // Stage 5 — Air layer refs
++  const aircraftRef        = useRef(aircraft || [])
++  const airVisibleRef      = useRef(airVisible ?? true)
++  const onAircraftClickRef = useRef(onAircraftClick)
++
+   // Live refs
+   const markersDataRef    = useRef(markers)
+   const visibleRef        = useRef(markersVisible)
+@@ -103,6 +114,9 @@ export default function MapView({
+   gridVisRef.current        = overlayVisibility?.grid ?? false
+   measureActiveRef.current  = measureActive
+   onMeasureResultRef.current = onMeasureResult
++  aircraftRef.current        = aircraft || []
++  airVisibleRef.current      = airVisible ?? true
++  onAircraftClickRef.current = onAircraftClick
+ 
+   // ── Marker helpers ────────────────────────────────────────────────────────
+   function clearMarkers() {
+@@ -367,6 +381,19 @@ export default function MapView({
+ 
+       drawMarkers(map)
+ 
++      // Stage 5 — Air layer
++      ensureAirLayers(map)
++      setAirData(map, aircraftRef.current)
++      if (!airVisibleRef.current) setAirVisibility(map, false)
++      AIR_CLICKABLE_LAYERS.forEach((lid) => {
++        map.on('click', lid, (e) => {
++          const props = e.features?.[0]?.properties
++          if (props) onAircraftClickRef.current?.(props)
++        })
++        map.on('mouseenter', lid, () => { map.getCanvas().style.cursor = 'pointer' })
++        map.on('mouseleave', lid, () => { map.getCanvas().style.cursor = '' })
++      })
++
+       // Attach grid canvas
+       if (gridCanvasRef.current) {
+         gridCleanupRef.current = attachGridCanvas(
+@@ -450,6 +477,22 @@ export default function MapView({
+     else map.once('load', apply)
+   }, [aois, selectedAoiId])
+ 
++  // ── Stage 5: aircraft data update ────────────────────────────────────────────
++  useEffect(() => {
++    const map = mapRef.current
++    if (!map) return
++    const apply = () => { ensureAirLayers(map); setAirData(map, aircraft) }
++    if (map.isStyleLoaded()) apply()
++    else map.once('load', apply)
++  }, [aircraft])
++
++  // ── Stage 5: aircraft visibility toggle ──────────────────────────────────────
++  useEffect(() => {
++    const map = mapRef.current
++    if (!map || !map.isStyleLoaded()) return
++    setAirVisibility(map, airVisible ?? true)
++  }, [airVisible])
++
+   // ── Draw mode: cursor + cancel cleanup ──────────────────────────────────────
+   useEffect(() => {
+     const map = mapRef.current
+diff --git a/osint-map-console/frontend/src/components/Sidebar.jsx b/osint-map-console/frontend/src/components/Sidebar.jsx
+index f152105..31e7f2c 100644
+--- a/osint-map-console/frontend/src/components/Sidebar.jsx
++++ b/osint-map-console/frontend/src/components/Sidebar.jsx
+@@ -1,5 +1,6 @@
+ import styles from '../styles/Sidebar.module.css'
+ import AlertsPanel from './AlertsPanel.jsx'
++import AircraftPanel from './AircraftPanel.jsx'
+ 
+ // Countries, Cities, Grid are implemented.
+ // Regions needs a global admin-1 vector source we don't have keyless; Routes/Zones land in Stage 2.
+@@ -8,6 +9,7 @@ const OVERLAY_LAYERS = [
+   { key: 'cities',    label: 'CITIES',    icon: '⊙', impl: true },
+   { key: 'grid',      label: 'GRID',      icon: '⊞', impl: true },
+   { key: 'regions',   label: 'REGIONS',   icon: '⊟', impl: false },
++  { key: 'air',       label: 'AIR ACTIVITY', icon: '✈', impl: true, isAir: true },
+   { key: 'routes',    label: 'ROUTES',    icon: '⇒', impl: false },
+   { key: 'zones',     label: 'ZONES',     icon: '◻', impl: false },
+ ]
+@@ -22,6 +24,8 @@ export default function Sidebar({
+   onFitAll,
+   aois = [], selectedAoiId, onSelectAoi, onDeleteAoi,
+   alerts = [], onReviewAlert, onCheckNow,
++  airVisible, onToggleAir,
++  airSnapshot, airNearAois, onAirRefresh, onAircraftClick, selectedAircraft,
+ }) {
+   return (
+     <div className={styles.sidebar}>
+@@ -37,8 +41,8 @@ export default function Sidebar({
+         {OVERLAY_LAYERS.map((l) => (
+           <LayerRow key={l.key}
+             icon={l.icon} label={l.label}
+-            active={l.impl ? (overlayVisibility?.[l.key] ?? false) : false}
+-            onToggle={l.impl ? () => onToggleOverlay(l.key) : null}
++            active={l.isAir ? (airVisible ?? true) : (l.impl ? (overlayVisibility?.[l.key] ?? false) : false)}
++            onToggle={l.isAir ? onToggleAir : (l.impl ? () => onToggleOverlay(l.key) : null)}
+             impl={l.impl}
+           />
+         ))}
+@@ -116,6 +120,13 @@ export default function Sidebar({
+         onReview={onReviewAlert}
+         onCheckNow={onCheckNow}
+       />
++
++      <AircraftPanel
++        snapshot={airSnapshot}
++        nearAois={airNearAois}
++        onRefresh={onAirRefresh}
++        onAircraftClick={onAircraftClick}
++      />
+     </div>
+   )
+ }
+diff --git a/osint-map-console/frontend/src/hooks/airLayer.js b/osint-map-console/frontend/src/hooks/airLayer.js
+new file mode 100644
+index 0000000..15ad8f2
+--- /dev/null
++++ b/osint-map-console/frontend/src/hooks/airLayer.js
+@@ -0,0 +1,98 @@
++// Stage 5 — Aircraft layer management for MapLibre
++// Renders aircraft as a GeoJSON SymbolLayer (chevron icon built from text glyph)
++// Falls back to circle layer if symbol fonts unavailable.
++// No trail in MVP — just current position + heading indicator.
++
++const AIR_SOURCE = 'src-air'
++const AIR_LAYER_BASE   = 'air-base'    // circle base (always visible)
++const AIR_LAYER_LABEL  = 'air-label'   // callsign label
++
++export function ensureAirLayers(map) {
++  if (map.getSource(AIR_SOURCE)) return  // already added
++
++  map.addSource(AIR_SOURCE, {
++    type: 'geojson',
++    data: { type: 'FeatureCollection', features: [] },
++  })
++
++  // Base dot — colored by altitude band
++  map.addLayer({
++    id:     AIR_LAYER_BASE,
++    type:   'circle',
++    source: AIR_SOURCE,
++    layout: { visibility: 'visible' },
++    paint: {
++      'circle-radius': [
++        'interpolate', ['linear'], ['zoom'],
++        2, 2, 5, 3.5, 8, 5, 12, 6,
++      ],
++      // Color by altitude: low=yellow, mid=cyan, high=white
++      'circle-color': [
++        'case',
++        ['<', ['coalesce', ['get', 'alt_m'], 0], 3000], '#ffcc00',
++        ['<', ['coalesce', ['get', 'alt_m'], 0], 9000], '#00e5ff',
++        '#ffffff',
++      ],
++      'circle-opacity': 0.85,
++      'circle-stroke-color': 'rgba(8,12,16,0.7)',
++      'circle-stroke-width': 0.8,
++    },
++  })
++
++  // Callsign label — only shown at zoom >= 6 to avoid clutter
++  map.addLayer({
++    id:      AIR_LAYER_LABEL,
++    type:    'symbol',
++    source:  AIR_SOURCE,
++    minzoom: 6,
++    layout: {
++      visibility: 'visible',
++      'text-field': ['coalesce', ['get', 'callsign'], ['get', 'icao24']],
++      'text-font':  ['Open Sans Regular'],
++      'text-size':  10,
++      'text-offset': [0, 1.4],
++      'text-anchor': 'top',
++      'text-allow-overlap': false,
++      'text-optional': true,
++    },
++    paint: {
++      'text-color': '#c8dae8',
++      'text-halo-color': 'rgba(8,12,16,0.9)',
++      'text-halo-width': 1.5,
++    },
++  })
++}
++
++export function removeAirLayers(map) {
++  [AIR_LAYER_LABEL, AIR_LAYER_BASE].forEach((id) => {
++    if (map.getLayer(id)) map.removeLayer(id)
++  })
++  if (map.getSource(AIR_SOURCE)) map.removeSource(AIR_SOURCE)
++}
++
++export function setAirData(map, aircraft) {
++  const src = map.getSource(AIR_SOURCE)
++  if (!src) return
++  const features = (aircraft || []).map((ac) => ({
++    type: 'Feature',
++    geometry: { type: 'Point', coordinates: [ac.lng, ac.lat] },
++    properties: {
++      icao24:   ac.icao24,
++      callsign: ac.callsign || ac.icao24,
++      alt_m:    ac.alt_m,
++      speed_ms: ac.speed_ms,
++      heading:  ac.heading,
++      country:  ac.country,
++    },
++  }))
++  src.setData({ type: 'FeatureCollection', features })
++}
++
++export function setAirVisibility(map, visible) {
++  const v = visible ? 'visible' : 'none'
++  ;[AIR_LAYER_BASE, AIR_LAYER_LABEL].forEach((id) => {
++    if (map.getLayer(id)) map.setLayoutProperty(id, 'visibility', v)
++  })
++}
++
++export const AIR_CLICKABLE_LAYERS = [AIR_LAYER_BASE]
+diff --git a/osint-map-console/frontend/src/hooks/useApi.js b/osint-map-console/frontend/src/hooks/useApi.js
+index e787154..b8a7449 100644
+--- a/osint-map-console/frontend/src/hooks/useApi.js
++++ b/osint-map-console/frontend/src/hooks/useApi.js
+@@ -143,3 +143,16 @@ export async function checkHealth() {
+ export async function triggerMonitoringCheck() {
+   return apiFetch('/api/monitoring/check-now', { method: 'POST' })
+ }
++
++// ── Stage 5 — Air traffic overlay ────────────────────────────────────────────
++export async function refreshAirTraffic() {
++  return apiFetch('/api/air/refresh', { method: 'POST' })
++}
++
++export async function fetchAirLatest() {
++  return apiFetch('/api/air/latest')
++}
++
++export async function fetchAirNearAois() {
++  return apiFetch('/api/air/near-aois')
++}
+diff --git a/osint-map-console/frontend/src/styles/AircraftPanel.module.css b/osint-map-console/frontend/src/styles/AircraftPanel.module.css
+new file mode 100644
+index 0000000..9cff583
+--- /dev/null
++++ b/osint-map-console/frontend/src/styles/AircraftPanel.module.css
+@@ -0,0 +1,121 @@
++.panel {
++  display: flex;
++  flex-direction: column;
++  border-top: 1px solid var(--border);
++}
++
++.header {
++  display: flex;
++  align-items: center;
++  gap: 7px;
++  padding: 8px 12px;
++  background: var(--bg-panel2);
++  border-bottom: 1px solid var(--border);
++  flex-shrink: 0;
++}
++.headerIcon  { color: var(--accent); font-size: 12px; }
++.headerLabel { font-family: var(--font-mono); font-size: 10px; letter-spacing: 2px; color: var(--accent); flex: 1; }
++.headerAge   { font-family: var(--font-mono); font-size: 9px; color: var(--text-muted); }
++
++.refreshRow { padding: 7px 10px; border-bottom: 1px solid var(--border); }
++.refreshBtn {
++  width: 100%;
++  background: transparent;
++  border: 1px solid var(--border-bright);
++  color: var(--accent);
++  font-family: var(--font-mono);
++  font-size: 10px;
++  letter-spacing: 1.5px;
++  padding: 5px 8px;
++  cursor: pointer;
++  text-align: left;
++  transition: background 0.12s, border-color 0.12s;
++}
++.refreshBtn:hover:not(:disabled) { background: var(--accent-glow); border-color: var(--accent); }
++.refreshBtn:disabled { opacity: 0.6; cursor: default; }
++.refreshBusy { color: var(--yellow) !important; border-color: var(--yellow) !important; animation: pulse 1.2s ease-in-out infinite; }
++@keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.5} }
++
++.summary {
++  display: flex;
++  align-items: center;
++  gap: 8px;
++  padding: 6px 12px;
++  border-bottom: 1px solid var(--border);
++}
++.summaryCount { font-family: var(--font-mono); font-size: 18px; color: var(--accent); line-height: 1; }
++.summaryLabel { font-family: var(--font-mono); font-size: 10px; color: var(--text-secondary); flex: 1; }
++.summaryAlert { font-family: var(--font-mono); font-size: 10px; color: var(--yellow); letter-spacing: 0.5px; }
++
++.empty {
++  display: flex; flex-direction: column; align-items: center;
++  padding: 20px 12px; gap: 4px;
++  font-family: var(--font-mono); font-size: 10px;
++  color: var(--text-muted); letter-spacing: 1px;
++}
++.emptyHint { font-size: 9px; opacity: 0.6; }
++
++.sectionHeader {
++  display: flex; align-items: center; justify-content: space-between;
++  padding: 6px 12px;
++  font-family: var(--font-mono); font-size: 9px; letter-spacing: 2px;
++  color: var(--yellow); border-bottom: 1px solid var(--border);
++}
++.sectionCount {
++  background: rgba(255,204,0,0.1);
++  border: 1px solid rgba(255,204,0,0.3);
++  font-size: 9px; padding: 1px 5px;
++  color: var(--yellow);
++}
++
++.aoiList { overflow-y: auto; max-height: 180px; }
++.aoiGroup { border-bottom: 1px solid var(--border); }
++
++.aoiRow {
++  display: flex; align-items: center; gap: 6px;
++  padding: 5px 12px; cursor: pointer;
++  transition: background 0.1s;
++}
++.aoiRow:hover { background: var(--bg-hover); }
++.aoiTitle { font-family: var(--font-ui); font-size: 11px; color: var(--text-primary); flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
++.aoiCount { font-family: var(--font-mono); font-size: 9px; color: var(--accent-dim); }
++.expandIcon { font-size: 8px; color: var(--text-muted); }
++
++.acList { background: var(--bg-base); }
++.acRow {
++  display: flex; align-items: center; justify-content: space-between;
++  padding: 4px 16px; cursor: pointer;
++  border-bottom: 1px solid rgba(30,45,61,0.5);
++  transition: background 0.1s;
++}
++.acRow:hover { background: var(--bg-hover); }
++.acSelected { background: var(--accent-glow) !important; border-left: 2px solid var(--accent); }
++.acCall   { font-family: var(--font-mono); font-size: 10px; color: var(--text-primary); }
++.acDetail { font-family: var(--font-mono); font-size: 9px; color: var(--text-muted); }
++
++.detail {
++  border-top: 1px solid var(--border);
++  background: var(--bg-panel2);
++}
++.detailHeader {
++  display: flex; align-items: center; justify-content: space-between;
++  padding: 6px 10px; border-bottom: 1px solid var(--border);
++}
++.detailCall { font-family: var(--font-mono); font-size: 12px; color: var(--accent); letter-spacing: 1px; }
++.detailClose { background: transparent; border: none; color: var(--text-muted); cursor: pointer; font-size: 10px; }
++.detailClose:hover { color: var(--red); }
++
++.detailGrid {
++  display: grid;
++  grid-template-columns: 64px 1fr;
++  gap: 0;
++  padding: 4px 0;
++}
++.dk {
++  font-family: var(--font-mono); font-size: 9px; letter-spacing: 1px;
++  color: var(--text-muted); padding: 3px 10px;
++}
++.dv {
++  font-family: var(--font-mono); font-size: 10px;
++  color: var(--text-secondary); padding: 3px 6px;
++}
+-- 
+2.43.0
+
