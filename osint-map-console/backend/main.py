@@ -749,3 +749,99 @@ def monitoring_check_now():
         return {"ok": True, **result}
     except Exception as e:
         return {"ok": False, "error": str(e), "checked": 0, "new_snapshots": 0, "new_alerts": 0}
+
+
+# ── Stage 5 — Air traffic overlay ────────────────────────────────────────────
+
+from air_traffic import fetch_aircraft, store_snapshot, load_latest_snapshot, intersect_with_aoi
+
+
+def _init_air_db(conn):
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS air_snapshot (
+            id           INTEGER PRIMARY KEY AUTOINCREMENT,
+            fetched_at   INTEGER NOT NULL,
+            aircraft_count INTEGER NOT NULL DEFAULT 0,
+            payload      TEXT NOT NULL DEFAULT '[]'
+        )
+    """)
+    conn.commit()
+
+
+# Init air table alongside markers
+_db_conn_for_init = get_db()
+_init_air_db(_db_conn_for_init)
+_db_conn_for_init.close()
+
+
+@app.post("/api/air/refresh")
+def air_refresh():
+    """
+    Manually trigger a full global aircraft fetch from OpenSky.
+    Stores snapshot in DB, returns aircraft list + metadata.
+    """
+    result = fetch_aircraft()           # no bbox → worldwide
+    conn = get_db()
+    if result["ok"] and result["aircraft"]:
+        store_snapshot(conn, result)
+    conn.close()
+    return {
+        "ok":       result["ok"],
+        "error":    result.get("error"),
+        "ts":       result["ts"],
+        "count":    result["count"],
+        "aircraft": result["aircraft"],
+    }
+
+
+@app.get("/api/air/latest")
+def air_latest():
+    """
+    Return the most recently fetched aircraft snapshot (from DB).
+    Does NOT make a new request to OpenSky.
+    """
+    conn = get_db()
+    snapshot = load_latest_snapshot(conn)
+    conn.close()
+    if not snapshot:
+        return {"ok": False, "ts": None, "count": 0, "aircraft": [],
+                "message": "No snapshot yet — call POST /api/air/refresh first"}
+    return {"ok": True, "ts": snapshot["ts"], "count": snapshot["count"],
+            "aircraft": snapshot["aircraft"]}
+
+
+@app.get("/api/air/near-aois")
+def air_near_aois():
+    """
+    Return aircraft that are currently near/inside each monitored AOI.
+    Uses the latest stored snapshot. Does NOT re-fetch from OpenSky.
+    """
+    conn = get_db()
+    snapshot = load_latest_snapshot(conn)
+    aoi_rows = conn.execute("SELECT * FROM aoi WHERE monitored = 1").fetchall()
+    conn.close()
+
+    if not snapshot:
+        return {"ok": False, "ts": None, "results": [],
+                "message": "No snapshot yet — call POST /api/air/refresh first"}
+
+    aoi_list = []
+    for r in aoi_rows:
+        import json as _json
+        try:
+            geom = _json.loads(r["geometry"])
+        except Exception:
+            continue
+        aoi_list.append({
+            "id":        r["id"],
+            "title":     r["title"],
+            "monitored": bool(r["monitored"]),
+            "geometry":  geom,
+        })
+
+    results = intersect_with_aoi(snapshot["aircraft"], aoi_list)
+    return {
+        "ok":      True,
+        "ts":      snapshot["ts"],
+        "results": results,
+    }

@@ -143,3 +143,16 @@ export async function checkHealth() {
 export async function triggerMonitoringCheck() {
   return apiFetch('/api/monitoring/check-now', { method: 'POST' })
 }
+
+// ── Stage 5 — Air traffic overlay ────────────────────────────────────────────
+export async function refreshAirTraffic() {
+  return apiFetch('/api/air/refresh', { method: 'POST' })
+}
+
+export async function fetchAirLatest() {
+  return apiFetch('/api/air/latest')
+}
+
+export async function fetchAirNearAois() {
+  return apiFetch('/api/air/near-aois')
+}

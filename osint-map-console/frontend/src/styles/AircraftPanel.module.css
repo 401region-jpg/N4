@@ -1,0 +1,121 @@
+.panel {
+  display: flex;
+  flex-direction: column;
+  border-top: 1px solid var(--border);
+}
+
+.header {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 8px 12px;
+  background: var(--bg-panel2);
+  border-bottom: 1px solid var(--border);
+  flex-shrink: 0;
+}
+.headerIcon  { color: var(--accent); font-size: 12px; }
+.headerLabel { font-family: var(--font-mono); font-size: 10px; letter-spacing: 2px; color: var(--accent); flex: 1; }
+.headerAge   { font-family: var(--font-mono); font-size: 9px; color: var(--text-muted); }
+
+.refreshRow { padding: 7px 10px; border-bottom: 1px solid var(--border); }
+.refreshBtn {
+  width: 100%;
+  background: transparent;
+  border: 1px solid var(--border-bright);
+  color: var(--accent);
+  font-family: var(--font-mono);
+  font-size: 10px;
+  letter-spacing: 1.5px;
+  padding: 5px 8px;
+  cursor: pointer;
+  text-align: left;
+  transition: background 0.12s, border-color 0.12s;
+}
+.refreshBtn:hover:not(:disabled) { background: var(--accent-glow); border-color: var(--accent); }
+.refreshBtn:disabled { opacity: 0.6; cursor: default; }
+.refreshBusy { color: var(--yellow) !important; border-color: var(--yellow) !important; animation: pulse 1.2s ease-in-out infinite; }
+@keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.5} }
+
+.summary {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 12px;
+  border-bottom: 1px solid var(--border);
+}
+.summaryCount { font-family: var(--font-mono); font-size: 18px; color: var(--accent); line-height: 1; }
+.summaryLabel { font-family: var(--font-mono); font-size: 10px; color: var(--text-secondary); flex: 1; }
+.summaryAlert { font-family: var(--font-mono); font-size: 10px; color: var(--yellow); letter-spacing: 0.5px; }
+
+.empty {
+  display: flex; flex-direction: column; align-items: center;
+  padding: 20px 12px; gap: 4px;
+  font-family: var(--font-mono); font-size: 10px;
+  color: var(--text-muted); letter-spacing: 1px;
+}
+.emptyHint { font-size: 9px; opacity: 0.6; }
+
+.sectionHeader {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 6px 12px;
+  font-family: var(--font-mono); font-size: 9px; letter-spacing: 2px;
+  color: var(--yellow); border-bottom: 1px solid var(--border);
+}
+.sectionCount {
+  background: rgba(255,204,0,0.1);
+  border: 1px solid rgba(255,204,0,0.3);
+  font-size: 9px; padding: 1px 5px;
+  color: var(--yellow);
+}
+
+.aoiList { overflow-y: auto; max-height: 180px; }
+.aoiGroup { border-bottom: 1px solid var(--border); }
+
+.aoiRow {
+  display: flex; align-items: center; gap: 6px;
+  padding: 5px 12px; cursor: pointer;
+  transition: background 0.1s;
+}
+.aoiRow:hover { background: var(--bg-hover); }
+.aoiTitle { font-family: var(--font-ui); font-size: 11px; color: var(--text-primary); flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.aoiCount { font-family: var(--font-mono); font-size: 9px; color: var(--accent-dim); }
+.expandIcon { font-size: 8px; color: var(--text-muted); }
+
+.acList { background: var(--bg-base); }
+.acRow {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 4px 16px; cursor: pointer;
+  border-bottom: 1px solid rgba(30,45,61,0.5);
+  transition: background 0.1s;
+}
+.acRow:hover { background: var(--bg-hover); }
+.acSelected { background: var(--accent-glow) !important; border-left: 2px solid var(--accent); }
+.acCall   { font-family: var(--font-mono); font-size: 10px; color: var(--text-primary); }
+.acDetail { font-family: var(--font-mono); font-size: 9px; color: var(--text-muted); }
+
+.detail {
+  border-top: 1px solid var(--border);
+  background: var(--bg-panel2);
+}
+.detailHeader {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 6px 10px; border-bottom: 1px solid var(--border);
+}
+.detailCall { font-family: var(--font-mono); font-size: 12px; color: var(--accent); letter-spacing: 1px; }
+.detailClose { background: transparent; border: none; color: var(--text-muted); cursor: pointer; font-size: 10px; }
+.detailClose:hover { color: var(--red); }
+
+.detailGrid {
+  display: grid;
+  grid-template-columns: 64px 1fr;
+  gap: 0;
+  padding: 4px 0;
+}
+.dk {
+  font-family: var(--font-mono); font-size: 9px; letter-spacing: 1px;
+  color: var(--text-muted); padding: 3px 10px;
+}
+.dv {
+  font-family: var(--font-mono); font-size: 10px;
+  color: var(--text-secondary); padding: 3px 6px;
+}
