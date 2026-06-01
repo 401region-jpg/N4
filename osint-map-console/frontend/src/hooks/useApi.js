@@ -156,8 +156,9 @@ export async function refreshAirTraffic(filters = {}) {
   return apiFetch(`/api/air/refresh${qs ? '?' + qs : ''}`, { method: 'POST' })
 }
 
-export async function fetchAirLatest() {
-  return apiFetch('/api/air/latest')
+export async function fetchAirLatest(params = {}) {
+  const qs = Object.keys(params).length ? '?' + new URLSearchParams(params).toString() : ''
+  return apiFetch(`/api/air/latest${qs}`)
 }
 
 export async function fetchAirNearAois(padKm) {
@@ -168,4 +169,8 @@ export async function fetchAirNearAois(padKm) {
 export async function fetchAirTrails(icao24) {
   const qs = icao24 ? `?icao24=${encodeURIComponent(icao24)}` : ''
   return apiFetch(`/api/air/trails${qs}`)
+}
+
+export async function fetchAirDetail(icao24) {
+  return apiFetch(`/api/air/detail/${encodeURIComponent(icao24)}`)
 }

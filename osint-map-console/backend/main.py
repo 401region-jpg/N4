@@ -783,6 +783,18 @@ def _init_air_db(conn):
         )
     """)
     conn.execute("CREATE INDEX IF NOT EXISTS idx_air_trail_icao24 ON air_trail (icao24, ts)")
+    # Stage 5.2 — optional aircraft metadata (populated via metadata_importer.py)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS aircraft_metadata (
+            icao24       TEXT PRIMARY KEY,
+            registration TEXT DEFAULT '',
+            manufacturer TEXT DEFAULT '',
+            model        TEXT DEFAULT '',
+            category     TEXT DEFAULT '',
+            owner        TEXT DEFAULT '',
+            operator     TEXT DEFAULT ''
+        )
+    """)
     conn.commit()
 
 
@@ -833,9 +845,18 @@ def air_refresh(
 
 
 @app.get("/api/air/latest")
-def air_latest():
+def air_latest(
+    search:      Optional[str]  = None,
+    category:    Optional[str]  = None,
+    alt_min:     Optional[float] = None,
+    alt_max:     Optional[float] = None,
+    speed_min:   Optional[float] = None,
+    speed_max:   Optional[float] = None,
+    near_aoi_only: Optional[bool] = None,
+):
     """
     Return the latest snapshot + current trails. No new OpenSky request.
+    Stage 5.2: optional query-param filters applied in Python over the stored JSON payload.
     """
     conn = get_db()
     snapshot = load_latest_snapshot(conn)
@@ -844,14 +865,116 @@ def air_latest():
         return {"ok": False, "ts": None, "count": 0, "aircraft": [], "trails": {},
                 "message": "No snapshot yet — call POST /api/air/refresh first"}
 
-    icao_set = {a["icao24"] for a in snapshot["aircraft"]}
+    aircraft = snapshot["aircraft"]
+
+    # Altitude filters
+    if alt_min is not None:
+        aircraft = [a for a in aircraft if a.get("alt_m") is not None and a["alt_m"] >= alt_min]
+    if alt_max is not None:
+        aircraft = [a for a in aircraft if a.get("alt_m") is not None and a["alt_m"] <= alt_max]
+
+    # Speed filters
+    if speed_min is not None:
+        aircraft = [a for a in aircraft if a.get("speed_ms") is not None and a["speed_ms"] >= speed_min]
+    if speed_max is not None:
+        aircraft = [a for a in aircraft if a.get("speed_ms") is not None and a["speed_ms"] <= speed_max]
+
+    # Free-text search across icao24 / callsign / country / metadata fields
+    if search:
+        needle = search.upper().strip()
+        if needle:
+            meta_rows = conn.execute(
+                "SELECT icao24 FROM aircraft_metadata WHERE "
+                "UPPER(registration) LIKE ? OR UPPER(manufacturer) LIKE ? OR "
+                "UPPER(model) LIKE ? OR UPPER(operator) LIKE ?",
+                (f"%{needle}%",) * 4
+            ).fetchall()
+            meta_icaos = {r["icao24"] for r in meta_rows}
+            aircraft = [a for a in aircraft if
+                        needle in (a.get("icao24") or "").upper() or
+                        needle in (a.get("callsign") or "").upper() or
+                        needle in (a.get("country") or "").upper() or
+                        a["icao24"] in meta_icaos]
+
+    # Category filter — supports quick group names and exact match
+    if category:
+        # Known category groups with their member categories (lowercase)
+        CATEGORY_GROUPS = {
+            "civilian": {"passenger", "airliner", "commuter", "regional",
+                         "civilian", "light", "small", "medium", "utility",
+                         "trainer", "sport", "glider", "ultralight"},
+            "cargo":    {"cargo", "freight", "freighter", "transport"},
+            "business": {"business jet", "business", "corporate",
+                         "executive", "bizjet", "jet", "bizliners"},
+            "rotor":    {"helicopter", "rotorcraft", "rotary",
+                         "gyrocopter", "heli", "multirotor"},
+            "unknown":  None,  # special: handled below
+        }
+        group = category.strip().lower()
+        if group == "all":
+            pass  # no filter
+        elif group == "unknown":
+            # Unknown = not in metadata at all, or in metadata with empty/unknown category
+            known_icaos = set()
+            for row in conn.execute(
+                "SELECT icao24 FROM aircraft_metadata "
+                "WHERE category IS NOT NULL AND category != '' AND category != 'unknown'"
+            ).fetchall():
+                known_icaos.add(row["icao24"])
+            aircraft = [a for a in aircraft if a["icao24"] not in known_icaos]
+        elif group in CATEGORY_GROUPS:
+            members = CATEGORY_GROUPS[group]
+            cat_rows = conn.execute(
+                "SELECT icao24 FROM aircraft_metadata WHERE LOWER(category) IN ({})"
+                .format(",".join("?" * len(members))),
+                list(members)
+            ).fetchall()
+            cat_icaos = {r["icao24"] for r in cat_rows}
+            if cat_icaos:
+                aircraft = [a for a in aircraft if a["icao24"] in cat_icaos]
+            else:
+                aircraft = []
+        else:
+            # Fallback: exact match on the raw value
+            cat_rows = conn.execute(
+                "SELECT icao24 FROM aircraft_metadata WHERE LOWER(category) = ?",
+                (group,)
+            ).fetchall()
+            cat_icaos = {r["icao24"] for r in cat_rows}
+            if cat_icaos:
+                aircraft = [a for a in aircraft if a["icao24"] in cat_icaos]
+            else:
+                aircraft = []
+
+    # Near-AOI-only filter — reuse existing intersect_with_aoi
+    if near_aoi_only:
+        aoi_rows = conn.execute("SELECT * FROM aoi WHERE monitored = 1").fetchall()
+        if aoi_rows and aircraft:
+            aoi_list = []
+            for r in aoi_rows:
+                try:
+                    geom = json.loads(r["geometry"])
+                except Exception:
+                    continue
+                aoi_list.append({
+                    "id": r["id"], "title": r["title"],
+                    "monitored": bool(r["monitored"]), "geometry": geom,
+                })
+            near_results = intersect_with_aoi(aircraft, aoi_list, pad_km=30.0)
+            near_icaos = set()
+            for nr in near_results:
+                for ac in nr["aircraft"]:
+                    near_icaos.add(ac["icao24"])
+            aircraft = [a for a in aircraft if a["icao24"] in near_icaos]
+
+    icao_set = {a["icao24"] for a in aircraft}
     trails   = load_trails(conn, icao_set) if icao_set else {}
     conn.close()
     return {
         "ok":       True,
         "ts":       snapshot["ts"],
-        "count":    snapshot["count"],
-        "aircraft": snapshot["aircraft"],
+        "count":    len(aircraft),
+        "aircraft": aircraft,
         "trails":   trails,
     }
 
@@ -886,6 +1009,117 @@ def air_near_aois(pad_km: float = 30.0):
 
     results = intersect_with_aoi(snapshot["aircraft"], aoi_list, pad_km=pad_km)
     return {"ok": True, "ts": snapshot["ts"], "results": results}
+
+
+# ── Stage 5.2 — Detail / trail-by-ICAO / search ────────────────────────────────
+
+
+@app.get("/api/air/detail/{icao24}")
+def air_detail(icao24: str):
+    """
+    Return a single aircraft from the latest snapshot + optional metadata.
+    404 if the ICAO24 is not found in the current snapshot.
+    """
+    icao = icao24.upper().strip()
+    conn = get_db()
+    snapshot = load_latest_snapshot(conn)
+    if not snapshot:
+        conn.close()
+        raise HTTPException(status_code=404, detail="No snapshot available")
+
+    match = None
+    for a in snapshot["aircraft"]:
+        if a["icao24"] == icao:
+            match = a
+            break
+    if not match:
+        conn.close()
+        raise HTTPException(status_code=404, detail="Aircraft not found in latest snapshot")
+
+    meta_row = conn.execute(
+        "SELECT * FROM aircraft_metadata WHERE icao24 = ?", (icao,)
+    ).fetchone()
+    metadata = dict(meta_row) if meta_row else {}
+    conn.close()
+    return {"ok": True, "aircraft": match, "metadata": metadata}
+
+
+@app.get("/api/air/trail/{icao24}")
+def air_trail_single(icao24: str):
+    """
+    Return trail points for a single aircraft (path-param variant).
+    """
+    icao = icao24.upper().strip()
+    conn = get_db()
+    trails = load_trails(conn, {icao})
+    conn.close()
+    return {"ok": True, "icao24": icao, "trail": trails.get(icao, [])}
+
+
+@app.get("/api/air/search")
+def air_search(q: str = ""):
+    """
+    Free-text search across the latest snapshot (icao24, callsign, country)
+    and aircraft_metadata (registration, manufacturer, model, owner, operator, category).
+    Returns combined results for any match.
+    """
+    needle = q.strip()
+    if not needle:
+        return {"ok": True, "q": q, "count": 0, "results": []}
+
+    conn = get_db()
+    snapshot = load_latest_snapshot(conn)
+    needle_up = needle.upper()
+
+    # Collect matching ICAO24 codes from snapshot
+    matched_icaos = set()
+    if snapshot:
+        for a in snapshot["aircraft"]:
+            if (needle_up in (a.get("icao24") or "").upper() or
+                needle_up in (a.get("callsign") or "").upper() or
+                needle_up in (a.get("country") or "").upper()):
+                matched_icaos.add(a["icao24"])
+
+    # Also match against metadata fields
+    like = f"%{needle}%"
+    for row in conn.execute(
+        "SELECT icao24 FROM aircraft_metadata WHERE "
+        "registration LIKE ? OR manufacturer LIKE ? OR model LIKE ? "
+        "OR owner LIKE ? OR operator LIKE ? OR category LIKE ?",
+        (like,) * 6,
+    ).fetchall():
+        matched_icaos.add(row["icao24"])
+
+    if not matched_icaos:
+        conn.close()
+        return {"ok": True, "q": q, "count": 0, "results": []}
+
+    # Build aircraft lookup from snapshot
+    ac_lookup = {}
+    if snapshot:
+        for a in snapshot["aircraft"]:
+            ac_lookup[a["icao24"]] = a
+
+    # Build metadata lookup
+    meta_lookup = {}
+    placeholders = ",".join("?" * len(matched_icaos))
+    for row in conn.execute(
+        f"SELECT * FROM aircraft_metadata WHERE icao24 IN ({placeholders})",
+        list(matched_icaos),
+    ).fetchall():
+        meta_lookup[row["icao24"]] = dict(row)
+
+    conn.close()
+
+    results = []
+    for icao in sorted(matched_icaos):
+        results.append({
+            "icao24":   icao,
+            "aircraft": ac_lookup.get(icao),
+            "metadata": meta_lookup.get(icao, {}),
+        })
+
+    return {"ok": True, "q": q, "count": len(results), "results": results}
 
 
 @app.get("/api/air/trails")

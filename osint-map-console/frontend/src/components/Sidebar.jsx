@@ -26,6 +26,9 @@ export default function Sidebar({
   alerts = [], onReviewAlert, onCheckNow,
   airVisible, onToggleAir,
   airSnapshot, airNearAois, onAirRefresh, onAircraftClick, selectedAircraft,
+  airFilters, onFilterChange, onClearFilters,
+  showTrails, onToggleTrails,
+  refreshInterval, onRefreshIntervalChange,
 }) {
   return (
     <div className={styles.sidebar}>
@@ -126,6 +129,14 @@ export default function Sidebar({
         nearAois={airNearAois}
         onRefresh={onAirRefresh}
         onAircraftClick={onAircraftClick}
+        selectedAircraft={selectedAircraft}
+        filters={airFilters}
+        onFilterChange={onFilterChange}
+        onClearFilters={onClearFilters}
+        showTrails={showTrails}
+        onToggleTrails={onToggleTrails}
+        refreshInterval={refreshInterval}
+        onRefreshIntervalChange={onRefreshIntervalChange}
       />
     </div>
   )

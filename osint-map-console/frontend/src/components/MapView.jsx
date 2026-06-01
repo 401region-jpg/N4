@@ -14,7 +14,7 @@ import {
   circleToPolygon, ringAreaMeters, formatArea, lineLengthMeters,
 } from '../hooks/aoiLayer.js'
 import {
-  ensureAirLayers, setAirData, setAirTrails, setAirVisibility, AIR_CLICKABLE_LAYERS,
+  ensureAirLayers, setAirData, setAirTrails, setAirVisibility, setTrailVisibility, AIR_CLICKABLE_LAYERS,
 } from '../hooks/airLayer.js'
 import styles from './MapView.module.css'
 
@@ -58,6 +58,10 @@ export default function MapView({
   airTrails,            // {icao24: [[lng,lat],...]} — Stage 5.1 trail history
   airVisible,           // bool
   onAircraftClick,      // (props) => void
+  nearAircraftIcaos,    // Set<string> — aircraft ICAO24 codes near any monitored AOI
+  showTrails,           // bool — independent trail layer toggle
+  selectedAircraft,     // object|null — currently selected aircraft for map emphasis
+  onDeselectAircraft,   // () => void — called on empty map click when selection exists
 }) {
   const containerRef   = useRef(null)
   const gridCanvasRef  = useRef(null)
@@ -88,10 +92,14 @@ export default function MapView({
   const measureRef = useRef({ active: false, pointA: null, line: null, popup: null })
 
   // Stage 5 / 5.1 — Air layer refs
-  const aircraftRef        = useRef(aircraft || [])
-  const airTrailsRef       = useRef(airTrails || {})
-  const airVisibleRef      = useRef(airVisible ?? true)
-  const onAircraftClickRef = useRef(onAircraftClick)
+  const aircraftRef            = useRef(aircraft || [])
+  const airTrailsRef           = useRef(airTrails || {})
+  const airVisibleRef          = useRef(airVisible ?? true)
+  const showTrailsRef          = useRef(showTrails ?? true)
+  const onAircraftClickRef     = useRef(onAircraftClick)
+  const nearAircraftIcaosRef   = useRef(nearAircraftIcaos || new Set())
+  const selectedAircraftRef    = useRef(selectedAircraft)
+  const onDeselectAircraftRef  = useRef(onDeselectAircraft)
 
   // Live refs
   const markersDataRef    = useRef(markers)
@@ -116,10 +124,14 @@ export default function MapView({
   gridVisRef.current        = overlayVisibility?.grid ?? false
   measureActiveRef.current  = measureActive
   onMeasureResultRef.current = onMeasureResult
-  aircraftRef.current        = aircraft || []
-  airTrailsRef.current       = airTrails || {}
-  airVisibleRef.current      = airVisible ?? true
-  onAircraftClickRef.current = onAircraftClick
+  aircraftRef.current          = aircraft || []
+  airTrailsRef.current         = airTrails || {}
+  airVisibleRef.current        = airVisible ?? true
+  showTrailsRef.current        = showTrails ?? true
+  onAircraftClickRef.current   = onAircraftClick
+  nearAircraftIcaosRef.current = nearAircraftIcaos || new Set()
+  selectedAircraftRef.current  = selectedAircraft
+  onDeselectAircraftRef.current = onDeselectAircraft
 
   // ── Marker helpers ────────────────────────────────────────────────────────
   function clearMarkers() {
@@ -342,6 +354,16 @@ export default function MapView({
       const aoiLayers = ['aoi-fill', 'aoi-line', 'aoi-point'].filter((l) => map.getLayer(l))
       if (aoiLayers.length && map.queryRenderedFeatures(e.point, { layers: aoiLayers }).length) return
 
+      // Don't drop a marker or deselect when clicking on an aircraft —
+      // the per-layer handler toggles selection.
+      const airClickable = AIR_CLICKABLE_LAYERS.filter((l) => map.getLayer(l))
+      if (airClickable.length && map.queryRenderedFeatures(e.point, { layers: airClickable }).length) return
+
+      // Empty background click: deselect aircraft if any is selected
+      if (selectedAircraftRef.current && onDeselectAircraftRef.current) {
+        onDeselectAircraftRef.current()
+      }
+
       onMapClickRef.current({ lat, lng })
     })
 
@@ -386,9 +408,10 @@ export default function MapView({
 
       // Stage 5 / 5.1 — Air layer
       ensureAirLayers(map)
-      setAirData(map, aircraftRef.current)
+      setAirData(map, aircraftRef.current, nearAircraftIcaosRef.current)
       setAirTrails(map, airTrailsRef.current, aircraftRef.current)
       if (!airVisibleRef.current) setAirVisibility(map, false)
+      if (!showTrailsRef.current) setTrailVisibility(map, false)
       AIR_CLICKABLE_LAYERS.forEach((lid) => {
         map.on('click', lid, (e) => {
           const props = e.features?.[0]?.properties
@@ -482,17 +505,19 @@ export default function MapView({
   }, [aois, selectedAoiId])
 
   // ── Stage 5 / 5.1: aircraft data + trail update ───────────────────────────────
+  // NOTE: selectedAircraft in deps so map emphasis re-renders on selection change
   useEffect(() => {
     const map = mapRef.current
     if (!map) return
+    const selIcao = selectedAircraft?.icao24
     const apply = () => {
       ensureAirLayers(map)
-      setAirData(map, aircraft)
-      setAirTrails(map, airTrails, aircraft)
+      setAirData(map, aircraft, nearAircraftIcaos, selIcao)
+      setAirTrails(map, airTrails, aircraft, selIcao)
     }
     if (map.isStyleLoaded()) apply()
     else map.once('load', apply)
-  }, [aircraft, airTrails])
+  }, [aircraft, airTrails, nearAircraftIcaos, selectedAircraft])
 
   // ── Stage 5: aircraft visibility toggle ──────────────────────────────────────
   useEffect(() => {
@@ -500,6 +525,13 @@ export default function MapView({
     if (!map || !map.isStyleLoaded()) return
     setAirVisibility(map, airVisible ?? true)
   }, [airVisible])
+
+  // ── Stage 5.2: trail layer independent toggle ───────────────────────────────
+  useEffect(() => {
+    const map = mapRef.current
+    if (!map || !map.isStyleLoaded()) return
+    setTrailVisibility(map, showTrails ?? true)
+  }, [showTrails])
 
   // ── Draw mode: cursor + cancel cleanup ──────────────────────────────────────
   useEffect(() => {
