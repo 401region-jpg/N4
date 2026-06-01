@@ -14,7 +14,8 @@ import {
   circleToPolygon, ringAreaMeters, formatArea, lineLengthMeters,
 } from '../hooks/aoiLayer.js'
 import {
-  ensureAirLayers, setAirData, setAirTrails, setAirVisibility, setTrailVisibility, AIR_CLICKABLE_LAYERS,
+  ensureAirLayers, setAirData, setAirTrails, setAirVisibility, setTrailVisibility,
+  setSelectedHighlight, AIR_CLICKABLE_LAYERS,
 } from '../hooks/airLayer.js'
 import styles from './MapView.module.css'
 
@@ -410,6 +411,7 @@ export default function MapView({
       ensureAirLayers(map)
       setAirData(map, aircraftRef.current, nearAircraftIcaosRef.current)
       setAirTrails(map, airTrailsRef.current, aircraftRef.current)
+      setSelectedHighlight(map, selectedAircraftRef.current)
       if (!airVisibleRef.current) setAirVisibility(map, false)
       if (!showTrailsRef.current) setTrailVisibility(map, false)
       AIR_CLICKABLE_LAYERS.forEach((lid) => {
@@ -505,19 +507,26 @@ export default function MapView({
   }, [aois, selectedAoiId])
 
   // ── Stage 5 / 5.1: aircraft data + trail update ───────────────────────────────
-  // NOTE: selectedAircraft in deps so map emphasis re-renders on selection change
   useEffect(() => {
     const map = mapRef.current
     if (!map) return
-    const selIcao = selectedAircraft?.icao24
     const apply = () => {
       ensureAirLayers(map)
-      setAirData(map, aircraft, nearAircraftIcaos, selIcao)
-      setAirTrails(map, airTrails, aircraft, selIcao)
+      setAirData(map, aircraft, nearAircraftIcaos)
+      setAirTrails(map, airTrails, aircraft)
     }
     if (map.isStyleLoaded()) apply()
     else map.once('load', apply)
-  }, [aircraft, airTrails, nearAircraftIcaos, selectedAircraft])
+  }, [aircraft, airTrails, nearAircraftIcaos])
+
+  // ── Stage 5.3: selection highlight overlay ──────────────────────────────────
+  useEffect(() => {
+    const map = mapRef.current
+    if (!map) return
+    const apply = () => setSelectedHighlight(map, selectedAircraft)
+    if (map.isStyleLoaded()) apply()
+    else map.once('load', apply)
+  }, [selectedAircraft])
 
   // ── Stage 5: aircraft visibility toggle ──────────────────────────────────────
   useEffect(() => {
