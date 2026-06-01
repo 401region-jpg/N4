@@ -1,5 +1,6 @@
 import styles from '../styles/Sidebar.module.css'
 import AlertsPanel from './AlertsPanel.jsx'
+import AircraftPanel from './AircraftPanel.jsx'
 
 // Countries, Cities, Grid are implemented.
 // Regions needs a global admin-1 vector source we don't have keyless; Routes/Zones land in Stage 2.
@@ -8,6 +9,7 @@ const OVERLAY_LAYERS = [
   { key: 'cities',    label: 'CITIES',    icon: '⊙', impl: true },
   { key: 'grid',      label: 'GRID',      icon: '⊞', impl: true },
   { key: 'regions',   label: 'REGIONS',   icon: '⊟', impl: false },
+  { key: 'air',       label: 'AIR ACTIVITY', icon: '✈', impl: true, isAir: true },
   { key: 'routes',    label: 'ROUTES',    icon: '⇒', impl: false },
   { key: 'zones',     label: 'ZONES',     icon: '◻', impl: false },
 ]
@@ -22,6 +24,11 @@ export default function Sidebar({
   onFitAll,
   aois = [], selectedAoiId, onSelectAoi, onDeleteAoi,
   alerts = [], onReviewAlert, onCheckNow,
+  airVisible, onToggleAir,
+  airSnapshot, airNearAois, onAirRefresh, onAircraftClick, selectedAircraft,
+  airFilters, onFilterChange, onClearFilters,
+  showTrails, onToggleTrails,
+  refreshInterval, onRefreshIntervalChange,
 }) {
   return (
     <div className={styles.sidebar}>
@@ -37,8 +44,8 @@ export default function Sidebar({
         {OVERLAY_LAYERS.map((l) => (
           <LayerRow key={l.key}
             icon={l.icon} label={l.label}
-            active={l.impl ? (overlayVisibility?.[l.key] ?? false) : false}
-            onToggle={l.impl ? () => onToggleOverlay(l.key) : null}
+            active={l.isAir ? (airVisible ?? true) : (l.impl ? (overlayVisibility?.[l.key] ?? false) : false)}
+            onToggle={l.isAir ? onToggleAir : (l.impl ? () => onToggleOverlay(l.key) : null)}
             impl={l.impl}
           />
         ))}
@@ -115,6 +122,21 @@ export default function Sidebar({
         onSelectAoi={onSelectAoi}
         onReview={onReviewAlert}
         onCheckNow={onCheckNow}
+      />
+
+      <AircraftPanel
+        snapshot={airSnapshot}
+        nearAois={airNearAois}
+        onRefresh={onAirRefresh}
+        onAircraftClick={onAircraftClick}
+        selectedAircraft={selectedAircraft}
+        filters={airFilters}
+        onFilterChange={onFilterChange}
+        onClearFilters={onClearFilters}
+        showTrails={showTrails}
+        onToggleTrails={onToggleTrails}
+        refreshInterval={refreshInterval}
+        onRefreshIntervalChange={onRefreshIntervalChange}
       />
     </div>
   )

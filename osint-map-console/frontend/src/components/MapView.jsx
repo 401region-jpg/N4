@@ -13,6 +13,10 @@ import {
   ensureAoiLayers, setAoiData, clearDraft, DRAFT_SOURCE,
   circleToPolygon, ringAreaMeters, formatArea, lineLengthMeters,
 } from '../hooks/aoiLayer.js'
+import {
+  ensureAirLayers, setAirData, setAirTrails, setAirVisibility, setTrailVisibility,
+  setSelectedHighlight, AIR_CLICKABLE_LAYERS,
+} from '../hooks/airLayer.js'
 import styles from './MapView.module.css'
 
 const DEFAULT_CENTER = [0, 20]
@@ -51,6 +55,14 @@ export default function MapView({
   drawMode,             // 'polygon' | 'route' | 'circle' | null
   onAoiComplete,        // (geometry, { kind, metric }) => void
   onDrawCancel,         // () => void
+  aircraft,             // [] — Stage 5 air layer data
+  airTrails,            // {icao24: [[lng,lat],...]} — Stage 5.1 trail history
+  airVisible,           // bool
+  onAircraftClick,      // (props) => void
+  nearAircraftIcaos,    // Set<string> — aircraft ICAO24 codes near any monitored AOI
+  showTrails,           // bool — independent trail layer toggle
+  selectedAircraft,     // object|null — currently selected aircraft for map emphasis
+  onDeselectAircraft,   // () => void — called on empty map click when selection exists
 }) {
   const containerRef   = useRef(null)
   const gridCanvasRef  = useRef(null)
@@ -80,6 +92,16 @@ export default function MapView({
   // Measure state (lives in refs to avoid re-render on every mousemove)
   const measureRef = useRef({ active: false, pointA: null, line: null, popup: null })
 
+  // Stage 5 / 5.1 — Air layer refs
+  const aircraftRef            = useRef(aircraft || [])
+  const airTrailsRef           = useRef(airTrails || {})
+  const airVisibleRef          = useRef(airVisible ?? true)
+  const showTrailsRef          = useRef(showTrails ?? true)
+  const onAircraftClickRef     = useRef(onAircraftClick)
+  const nearAircraftIcaosRef   = useRef(nearAircraftIcaos || new Set())
+  const selectedAircraftRef    = useRef(selectedAircraft)
+  const onDeselectAircraftRef  = useRef(onDeselectAircraft)
+
   // Live refs
   const markersDataRef    = useRef(markers)
   const visibleRef        = useRef(markersVisible)
@@ -103,6 +125,14 @@ export default function MapView({
   gridVisRef.current        = overlayVisibility?.grid ?? false
   measureActiveRef.current  = measureActive
   onMeasureResultRef.current = onMeasureResult
+  aircraftRef.current          = aircraft || []
+  airTrailsRef.current         = airTrails || {}
+  airVisibleRef.current        = airVisible ?? true
+  showTrailsRef.current        = showTrails ?? true
+  onAircraftClickRef.current   = onAircraftClick
+  nearAircraftIcaosRef.current = nearAircraftIcaos || new Set()
+  selectedAircraftRef.current  = selectedAircraft
+  onDeselectAircraftRef.current = onDeselectAircraft
 
   // ── Marker helpers ────────────────────────────────────────────────────────
   function clearMarkers() {
@@ -325,6 +355,16 @@ export default function MapView({
       const aoiLayers = ['aoi-fill', 'aoi-line', 'aoi-point'].filter((l) => map.getLayer(l))
       if (aoiLayers.length && map.queryRenderedFeatures(e.point, { layers: aoiLayers }).length) return
 
+      // Don't drop a marker or deselect when clicking on an aircraft —
+      // the per-layer handler toggles selection.
+      const airClickable = AIR_CLICKABLE_LAYERS.filter((l) => map.getLayer(l))
+      if (airClickable.length && map.queryRenderedFeatures(e.point, { layers: airClickable }).length) return
+
+      // Empty background click: deselect aircraft if any is selected
+      if (selectedAircraftRef.current && onDeselectAircraftRef.current) {
+        onDeselectAircraftRef.current()
+      }
+
       onMapClickRef.current({ lat, lng })
     })
 
@@ -366,6 +406,22 @@ export default function MapView({
       })
 
       drawMarkers(map)
+
+      // Stage 5 / 5.1 — Air layer
+      ensureAirLayers(map)
+      setAirData(map, aircraftRef.current, nearAircraftIcaosRef.current)
+      setAirTrails(map, airTrailsRef.current, aircraftRef.current)
+      setSelectedHighlight(map, selectedAircraftRef.current)
+      if (!airVisibleRef.current) setAirVisibility(map, false)
+      if (!showTrailsRef.current) setTrailVisibility(map, false)
+      AIR_CLICKABLE_LAYERS.forEach((lid) => {
+        map.on('click', lid, (e) => {
+          const props = e.features?.[0]?.properties
+          if (props) onAircraftClickRef.current?.(props)
+        })
+        map.on('mouseenter', lid, () => { map.getCanvas().style.cursor = 'pointer' })
+        map.on('mouseleave', lid, () => { map.getCanvas().style.cursor = '' })
+      })
 
       // Attach grid canvas
       if (gridCanvasRef.current) {
@@ -449,6 +505,42 @@ export default function MapView({
     if (map.isStyleLoaded()) apply()
     else map.once('load', apply)
   }, [aois, selectedAoiId])
+
+  // ── Stage 5 / 5.1: aircraft data + trail update ───────────────────────────────
+  useEffect(() => {
+    const map = mapRef.current
+    if (!map) return
+    const apply = () => {
+      ensureAirLayers(map)
+      setAirData(map, aircraft, nearAircraftIcaos)
+      setAirTrails(map, airTrails, aircraft)
+    }
+    if (map.isStyleLoaded()) apply()
+    else map.once('load', apply)
+  }, [aircraft, airTrails, nearAircraftIcaos])
+
+  // ── Stage 5.3: selection highlight overlay ──────────────────────────────────
+  useEffect(() => {
+    const map = mapRef.current
+    if (!map) return
+    const apply = () => setSelectedHighlight(map, selectedAircraft)
+    if (map.isStyleLoaded()) apply()
+    else map.once('load', apply)
+  }, [selectedAircraft])
+
+  // ── Stage 5: aircraft visibility toggle ──────────────────────────────────────
+  useEffect(() => {
+    const map = mapRef.current
+    if (!map || !map.isStyleLoaded()) return
+    setAirVisibility(map, airVisible ?? true)
+  }, [airVisible])
+
+  // ── Stage 5.2: trail layer independent toggle ───────────────────────────────
+  useEffect(() => {
+    const map = mapRef.current
+    if (!map || !map.isStyleLoaded()) return
+    setTrailVisibility(map, showTrails ?? true)
+  }, [showTrails])
 
   // ── Draw mode: cursor + cancel cleanup ──────────────────────────────────────
   useEffect(() => {

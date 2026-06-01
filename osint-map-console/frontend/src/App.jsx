@@ -1,9 +1,10 @@
-import { useState, useEffect, useCallback, useRef } from 'react'
+import { useState, useEffect, useCallback, useRef, useMemo } from 'react'
 import MapView from './components/MapView.jsx'
 import Sidebar from './components/Sidebar.jsx'
 import TopBar from './components/TopBar.jsx'
 import MarkerPanel from './components/MarkerPanel.jsx'
 import AoiPanel from './components/AoiPanel.jsx'
+import AircraftPanel from './components/AircraftPanel.jsx'
 import MarkerModal from './components/MarkerModal.jsx'
 import Toast from './components/Toast.jsx'
 import {
@@ -11,6 +12,7 @@ import {
   deleteMarker, exportGeoJSON, importGeoJSON, checkHealth,
   fetchAois, createAoi, deleteAoi,
   setAoiMonitored, fetchAlerts, reviewAlert, triggerMonitoringCheck,
+  refreshAirTraffic, fetchAirLatest, fetchAirNearAois,
 } from './hooks/useApi.js'
 import { DEFAULT_BASEMAP } from './hooks/basemaps.js'
 import styles from './styles/App.module.css'
@@ -20,6 +22,8 @@ const INIT_OVERLAY = {
   cities:    false,
   grid:      false,
 }
+
+// Air layer visibility is separate (handled via airVisible state, not overlayVisibility)
 
 // Rough centroid of an AOI geometry for fly-to.
 function aoiCentroid(geom) {
@@ -53,7 +57,17 @@ export default function App() {
   const [selectedAoiId,     setSelectedAoiId]     = useState(null)
   const [drawMode,          setDrawMode]          = useState(null) // 'polygon'|'route'|'circle'|null
   const [alerts,            setAlerts]            = useState([])
-  const [toasts,            setToasts]            = useState([])
+  // Stage 5 / 5.1 — Air traffic
+  const [airSnapshot,       setAirSnapshot]       = useState(null)    // {ts, count, aircraft, trails}
+  const [airNearAois,       setAirNearAois]       = useState([])
+  const [airVisible,        setAirVisible]        = useState(true)
+  const [selectedAircraft,  setSelectedAircraft]  = useState(null)
+  // Stage 5.2 — Extra controls
+  const DEFAULT_AIR_FILTERS = { altMin: '', altMax: '', speedMin: '', speedMax: '', callsign: '', search: '', category: '', nearAoiOnly: false }
+  const [airFilters,        setAirFilters]         = useState(DEFAULT_AIR_FILTERS)
+  const [refreshInterval,   setRefreshInterval]    = useState('30000') // 'manual' | ms string
+  const [showTrails,        setShowTrails]         = useState(true)
+  const [toasts,            setToasts]             = useState([])
   const toastIdRef   = useRef(0)
   const searchTimerRef = useRef(null)
 
@@ -237,6 +251,102 @@ export default function App() {
   }, []) // eslint-disable-line
 
 
+  // ── Stage 5 / 5.1: Air traffic ───────────────────────────────────────────────
+  const handleAirRefresh = useCallback(async (filters = {}, silent = false) => {
+    try {
+      // Server-side filters (sent to POST /api/air/refresh — reduces OpenSky bandwidth)
+      const serverFilters = {}
+      if (filters.alt_min   != null)  serverFilters.alt_min   = filters.alt_min
+      if (filters.alt_max   != null)  serverFilters.alt_max   = filters.alt_max
+      if (filters.speed_min != null)  serverFilters.speed_min = filters.speed_min
+      if (filters.callsign)           serverFilters.callsign  = filters.callsign
+
+      const result = await refreshAirTraffic(serverFilters)
+      if (!result.ok) {
+        showToast(`Air refresh failed: ${result.error}`, 'error')
+        return
+      }
+
+      // Client-side filters (applied via GET /api/air/latest using the stored snapshot)
+      const clientFilters = {}
+      if (filters.search)          clientFilters.search        = filters.search
+      if (filters.category)        clientFilters.category      = filters.category
+      if (filters.alt_min != null) clientFilters.alt_min       = filters.alt_min
+      if (filters.alt_max != null) clientFilters.alt_max       = filters.alt_max
+      if (filters.speed_min != null) clientFilters.speed_min   = filters.speed_min
+      if (filters.speed_max != null) clientFilters.speed_max   = filters.speed_max
+      if (filters.near_aoi_only)   clientFilters.near_aoi_only = 'true'
+
+      let acData = result
+      if (Object.keys(clientFilters).length) {
+        const latestResult = await fetchAirLatest(clientFilters)
+        if (latestResult.ok) acData = latestResult
+      }
+
+      setAirSnapshot({
+        ts:       acData.ts,
+        count:    acData.count,
+        aircraft: acData.aircraft,
+        trails:   acData.trails || {},
+      })
+
+      // Near-AOI check
+      const near = await fetchAirNearAois()
+      if (near.ok) setAirNearAois(near.results || [])
+
+      if (!silent && result.count > 0) {
+        const filterNote = Object.values(filters).filter(Boolean).length ? ' (filtered)' : ''
+        showToast(`${result.count} aircraft loaded${filterNote}`, 'info')
+      }
+    } catch (e) { showToast(e.message || 'Air refresh failed') }
+  }, [showToast])
+
+  const handleAircraftClick = useCallback((props) => {
+    setSelectedAircraft((prev) => prev?.icao24 === props?.icao24 ? null : props)
+  }, [])
+
+  // Stage 5.2 — filter state management
+  const handleFilterChange = useCallback((key, val) => {
+    setAirFilters((prev) => ({ ...prev, [key]: val }))
+  }, [])
+
+  const handleClearFilters = useCallback(() => {
+    setAirFilters(DEFAULT_AIR_FILTERS)
+  }, [])
+
+  // Stage 5.2 — safe polling (reads filters via ref to avoid reset on every keystroke)
+  const pollingRef = useRef(null)
+  const airFiltersRef = useRef(airFilters)
+  airFiltersRef.current = airFilters
+  useEffect(() => {
+    if (pollingRef.current) clearInterval(pollingRef.current)
+    if (refreshInterval === 'manual') return
+    const ms = parseInt(refreshInterval, 10)
+    if (isNaN(ms) || ms < 15000) return
+    pollingRef.current = setInterval(() => {
+      const f = airFiltersRef.current
+      const parsed = {
+        alt_min:   f.altMin   !== '' ? parseFloat(f.altMin)   : undefined,
+        alt_max:   f.altMax   !== '' ? parseFloat(f.altMax)   : undefined,
+        speed_min: f.speedMin !== '' ? parseFloat(f.speedMin) : undefined,
+        speed_max: f.speedMax !== '' ? parseFloat(f.speedMax) : undefined,
+        callsign:  f.callsign || undefined,
+        search:    f.search   || undefined,
+        category:  f.category || undefined,
+        near_aoi_only: f.nearAoiOnly || undefined,
+      }
+      handleAirRefresh(parsed, true)
+    }, ms)
+    return () => { if (pollingRef.current) clearInterval(pollingRef.current) }
+  }, [refreshInterval, handleAirRefresh])
+
+
+  const nearAircraftIcaos = useMemo(() => {
+    const set = new Set()
+    airNearAois.forEach((r) => r.aircraft.forEach((a) => set.add(a.icao24)))
+    return set
+  }, [airNearAois])
+
   const selectedAoi = aois.find((a) => a.id === selectedAoiId) || null
 
   // ── Copy center coords ─────────────────────────────────────────────────────
@@ -289,6 +399,20 @@ export default function App() {
           alerts={alerts}
           onReviewAlert={handleReviewAlert}
           onCheckNow={handleCheckNow}
+          airVisible={airVisible}
+          onToggleAir={() => setAirVisible((v) => !v)}
+          airSnapshot={airSnapshot}
+          airNearAois={airNearAois}
+          onAirRefresh={handleAirRefresh}
+          onAircraftClick={handleAircraftClick}
+          selectedAircraft={selectedAircraft}
+          airFilters={airFilters}
+          onFilterChange={handleFilterChange}
+          onClearFilters={handleClearFilters}
+          showTrails={showTrails}
+          onToggleTrails={() => setShowTrails((v) => !v)}
+          refreshInterval={refreshInterval}
+          onRefreshIntervalChange={setRefreshInterval}
         />
 
         <div className={styles.mapContainer}>
@@ -314,6 +438,14 @@ export default function App() {
             drawMode={drawMode}
             onAoiComplete={handleAoiComplete}
             onDrawCancel={() => setDrawMode(null)}
+            aircraft={airSnapshot?.aircraft || []}
+            airTrails={airSnapshot?.trails || {}}
+            airVisible={airVisible}
+            onAircraftClick={handleAircraftClick}
+            nearAircraftIcaos={nearAircraftIcaos}
+            showTrails={showTrails}
+            selectedAircraft={selectedAircraft}
+            onDeselectAircraft={() => setSelectedAircraft(null)}
           />
         </div>
 
