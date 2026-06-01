@@ -143,3 +143,29 @@ export async function checkHealth() {
 export async function triggerMonitoringCheck() {
   return apiFetch('/api/monitoring/check-now', { method: 'POST' })
 }
+
+// ── Stage 5 / 5.1 — Air traffic overlay ──────────────────────────────────────
+export async function refreshAirTraffic(filters = {}) {
+  // filters: { alt_min, alt_max, speed_min, callsign } — all optional
+  const params = new URLSearchParams()
+  if (filters.alt_min  != null) params.set('alt_min',   filters.alt_min)
+  if (filters.alt_max  != null) params.set('alt_max',   filters.alt_max)
+  if (filters.speed_min != null) params.set('speed_min', filters.speed_min)
+  if (filters.callsign)          params.set('callsign',  filters.callsign)
+  const qs = params.toString()
+  return apiFetch(`/api/air/refresh${qs ? '?' + qs : ''}`, { method: 'POST' })
+}
+
+export async function fetchAirLatest() {
+  return apiFetch('/api/air/latest')
+}
+
+export async function fetchAirNearAois(padKm) {
+  const qs = padKm != null ? `?pad_km=${padKm}` : ''
+  return apiFetch(`/api/air/near-aois${qs}`)
+}
+
+export async function fetchAirTrails(icao24) {
+  const qs = icao24 ? `?icao24=${encodeURIComponent(icao24)}` : ''
+  return apiFetch(`/api/air/trails${qs}`)
+}

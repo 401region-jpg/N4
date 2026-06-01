@@ -749,3 +749,160 @@ def monitoring_check_now():
         return {"ok": True, **result}
     except Exception as e:
         return {"ok": False, "error": str(e), "checked": 0, "new_snapshots": 0, "new_alerts": 0}
+
+
+# ── Stage 5 / 5.1 — Air traffic overlay ──────────────────────────────────────
+
+from air_traffic import (
+    fetch_aircraft, fetch_aircraft_filtered,
+    store_snapshot, load_latest_snapshot,
+    upsert_trails, load_trails,
+    intersect_with_aoi,
+)
+
+
+def _init_air_db(conn):
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS air_snapshot (
+            id             INTEGER PRIMARY KEY AUTOINCREMENT,
+            fetched_at     INTEGER NOT NULL,
+            aircraft_count INTEGER NOT NULL DEFAULT 0,
+            payload        TEXT NOT NULL DEFAULT '[]'
+        )
+    """)
+    # Stage 5.1 — trail history table
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS air_trail (
+            id      INTEGER PRIMARY KEY AUTOINCREMENT,
+            icao24  TEXT NOT NULL,
+            ts      INTEGER NOT NULL,
+            lat     REAL NOT NULL,
+            lng     REAL NOT NULL,
+            alt_m   REAL,
+            heading REAL
+        )
+    """)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_air_trail_icao24 ON air_trail (icao24, ts)")
+    conn.commit()
+
+
+# Init air tables alongside markers
+_db_conn_for_init = get_db()
+_init_air_db(_db_conn_for_init)
+_db_conn_for_init.close()
+
+
+@app.post("/api/air/refresh")
+def air_refresh(
+    alt_min: Optional[float] = None,
+    alt_max: Optional[float] = None,
+    speed_min: Optional[float] = None,
+    callsign: Optional[str] = None,
+):
+    """
+    Stage 5.1: Fetch from OpenSky, store snapshot + trail points.
+    Optional query-param filters: alt_min, alt_max, speed_min, callsign.
+    Returns aircraft list, trail data for all aircraft, and metadata.
+    """
+    if any(v is not None for v in [alt_min, alt_max, speed_min, callsign]):
+        result = fetch_aircraft_filtered(
+            alt_min=alt_min, alt_max=alt_max,
+            speed_min=speed_min, callsign_contains=callsign,
+        )
+    else:
+        result = fetch_aircraft()
+
+    conn = get_db()
+    if result["ok"] and result["aircraft"]:
+        store_snapshot(conn, result)
+        upsert_trails(conn, result["aircraft"], result["ts"])
+
+    # Return trails for the aircraft we just fetched
+    icao_set = {a["icao24"] for a in result["aircraft"]} if result["aircraft"] else set()
+    trails = load_trails(conn, icao_set) if icao_set else {}
+    conn.close()
+
+    return {
+        "ok":       result["ok"],
+        "error":    result.get("error"),
+        "ts":       result["ts"],
+        "count":    result["count"],
+        "aircraft": result["aircraft"],
+        "trails":   trails,
+    }
+
+
+@app.get("/api/air/latest")
+def air_latest():
+    """
+    Return the latest snapshot + current trails. No new OpenSky request.
+    """
+    conn = get_db()
+    snapshot = load_latest_snapshot(conn)
+    if not snapshot:
+        conn.close()
+        return {"ok": False, "ts": None, "count": 0, "aircraft": [], "trails": {},
+                "message": "No snapshot yet — call POST /api/air/refresh first"}
+
+    icao_set = {a["icao24"] for a in snapshot["aircraft"]}
+    trails   = load_trails(conn, icao_set) if icao_set else {}
+    conn.close()
+    return {
+        "ok":       True,
+        "ts":       snapshot["ts"],
+        "count":    snapshot["count"],
+        "aircraft": snapshot["aircraft"],
+        "trails":   trails,
+    }
+
+
+@app.get("/api/air/near-aois")
+def air_near_aois(pad_km: float = 30.0):
+    """
+    Stage 5.1: geometry-aware intersection (polygon ray-cast, haversine for points,
+    corridor for lines). pad_km controls buffer size. Default 30 km.
+    """
+    conn = get_db()
+    snapshot = load_latest_snapshot(conn)
+    aoi_rows = conn.execute("SELECT * FROM aoi WHERE monitored = 1").fetchall()
+    conn.close()
+
+    if not snapshot:
+        return {"ok": False, "ts": None, "results": [],
+                "message": "No snapshot yet — call POST /api/air/refresh first"}
+
+    aoi_list = []
+    for r in aoi_rows:
+        try:
+            geom = json.loads(r["geometry"])
+        except Exception:
+            continue
+        aoi_list.append({
+            "id":        r["id"],
+            "title":     r["title"],
+            "monitored": bool(r["monitored"]),
+            "geometry":  geom,
+        })
+
+    results = intersect_with_aoi(snapshot["aircraft"], aoi_list, pad_km=pad_km)
+    return {"ok": True, "ts": snapshot["ts"], "results": results}
+
+
+@app.get("/api/air/trails")
+def air_trails(icao24: Optional[str] = None):
+    """
+    Return trail data. If icao24 query param given, return that aircraft only.
+    Otherwise return trails for all aircraft in the latest snapshot.
+    """
+    conn = get_db()
+    if icao24:
+        trails = load_trails(conn, {icao24.upper()})
+    else:
+        snapshot = load_latest_snapshot(conn)
+        if snapshot:
+            icao_set = {a["icao24"] for a in snapshot["aircraft"]}
+            trails   = load_trails(conn, icao_set) if icao_set else {}
+        else:
+            trails = {}
+    conn.close()
+    return {"ok": True, "trails": trails}

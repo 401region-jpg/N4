@@ -13,6 +13,9 @@ import {
   ensureAoiLayers, setAoiData, clearDraft, DRAFT_SOURCE,
   circleToPolygon, ringAreaMeters, formatArea, lineLengthMeters,
 } from '../hooks/aoiLayer.js'
+import {
+  ensureAirLayers, setAirData, setAirTrails, setAirVisibility, AIR_CLICKABLE_LAYERS,
+} from '../hooks/airLayer.js'
 import styles from './MapView.module.css'
 
 const DEFAULT_CENTER = [0, 20]
@@ -51,6 +54,10 @@ export default function MapView({
   drawMode,             // 'polygon' | 'route' | 'circle' | null
   onAoiComplete,        // (geometry, { kind, metric }) => void
   onDrawCancel,         // () => void
+  aircraft,             // [] — Stage 5 air layer data
+  airTrails,            // {icao24: [[lng,lat],...]} — Stage 5.1 trail history
+  airVisible,           // bool
+  onAircraftClick,      // (props) => void
 }) {
   const containerRef   = useRef(null)
   const gridCanvasRef  = useRef(null)
@@ -80,6 +87,12 @@ export default function MapView({
   // Measure state (lives in refs to avoid re-render on every mousemove)
   const measureRef = useRef({ active: false, pointA: null, line: null, popup: null })
 
+  // Stage 5 / 5.1 — Air layer refs
+  const aircraftRef        = useRef(aircraft || [])
+  const airTrailsRef       = useRef(airTrails || {})
+  const airVisibleRef      = useRef(airVisible ?? true)
+  const onAircraftClickRef = useRef(onAircraftClick)
+
   // Live refs
   const markersDataRef    = useRef(markers)
   const visibleRef        = useRef(markersVisible)
@@ -103,6 +116,10 @@ export default function MapView({
   gridVisRef.current        = overlayVisibility?.grid ?? false
   measureActiveRef.current  = measureActive
   onMeasureResultRef.current = onMeasureResult
+  aircraftRef.current        = aircraft || []
+  airTrailsRef.current       = airTrails || {}
+  airVisibleRef.current      = airVisible ?? true
+  onAircraftClickRef.current = onAircraftClick
 
   // ── Marker helpers ────────────────────────────────────────────────────────
   function clearMarkers() {
@@ -367,6 +384,20 @@ export default function MapView({
 
       drawMarkers(map)
 
+      // Stage 5 / 5.1 — Air layer
+      ensureAirLayers(map)
+      setAirData(map, aircraftRef.current)
+      setAirTrails(map, airTrailsRef.current, aircraftRef.current)
+      if (!airVisibleRef.current) setAirVisibility(map, false)
+      AIR_CLICKABLE_LAYERS.forEach((lid) => {
+        map.on('click', lid, (e) => {
+          const props = e.features?.[0]?.properties
+          if (props) onAircraftClickRef.current?.(props)
+        })
+        map.on('mouseenter', lid, () => { map.getCanvas().style.cursor = 'pointer' })
+        map.on('mouseleave', lid, () => { map.getCanvas().style.cursor = '' })
+      })
+
       // Attach grid canvas
       if (gridCanvasRef.current) {
         gridCleanupRef.current = attachGridCanvas(
@@ -449,6 +480,26 @@ export default function MapView({
     if (map.isStyleLoaded()) apply()
     else map.once('load', apply)
   }, [aois, selectedAoiId])
+
+  // ── Stage 5 / 5.1: aircraft data + trail update ───────────────────────────────
+  useEffect(() => {
+    const map = mapRef.current
+    if (!map) return
+    const apply = () => {
+      ensureAirLayers(map)
+      setAirData(map, aircraft)
+      setAirTrails(map, airTrails, aircraft)
+    }
+    if (map.isStyleLoaded()) apply()
+    else map.once('load', apply)
+  }, [aircraft, airTrails])
+
+  // ── Stage 5: aircraft visibility toggle ──────────────────────────────────────
+  useEffect(() => {
+    const map = mapRef.current
+    if (!map || !map.isStyleLoaded()) return
+    setAirVisibility(map, airVisible ?? true)
+  }, [airVisible])
 
   // ── Draw mode: cursor + cancel cleanup ──────────────────────────────────────
   useEffect(() => {

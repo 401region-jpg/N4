@@ -4,6 +4,7 @@ import Sidebar from './components/Sidebar.jsx'
 import TopBar from './components/TopBar.jsx'
 import MarkerPanel from './components/MarkerPanel.jsx'
 import AoiPanel from './components/AoiPanel.jsx'
+import AircraftPanel from './components/AircraftPanel.jsx'
 import MarkerModal from './components/MarkerModal.jsx'
 import Toast from './components/Toast.jsx'
 import {
@@ -11,6 +12,7 @@ import {
   deleteMarker, exportGeoJSON, importGeoJSON, checkHealth,
   fetchAois, createAoi, deleteAoi,
   setAoiMonitored, fetchAlerts, reviewAlert, triggerMonitoringCheck,
+  refreshAirTraffic, fetchAirLatest, fetchAirNearAois,
 } from './hooks/useApi.js'
 import { DEFAULT_BASEMAP } from './hooks/basemaps.js'
 import styles from './styles/App.module.css'
@@ -20,6 +22,8 @@ const INIT_OVERLAY = {
   cities:    false,
   grid:      false,
 }
+
+// Air layer visibility is separate (handled via airVisible state, not overlayVisibility)
 
 // Rough centroid of an AOI geometry for fly-to.
 function aoiCentroid(geom) {
@@ -53,6 +57,11 @@ export default function App() {
   const [selectedAoiId,     setSelectedAoiId]     = useState(null)
   const [drawMode,          setDrawMode]          = useState(null) // 'polygon'|'route'|'circle'|null
   const [alerts,            setAlerts]            = useState([])
+  // Stage 5 / 5.1 — Air traffic
+  const [airSnapshot,       setAirSnapshot]       = useState(null)    // {ts, count, aircraft, trails}
+  const [airNearAois,       setAirNearAois]       = useState([])
+  const [airVisible,        setAirVisible]        = useState(true)
+  const [selectedAircraft,  setSelectedAircraft]  = useState(null)
   const [toasts,            setToasts]            = useState([])
   const toastIdRef   = useRef(0)
   const searchTimerRef = useRef(null)
@@ -237,6 +246,35 @@ export default function App() {
   }, []) // eslint-disable-line
 
 
+  // ── Stage 5 / 5.1: Air traffic ───────────────────────────────────────────────
+  const handleAirRefresh = useCallback(async (filters = {}) => {
+    try {
+      const result = await refreshAirTraffic(filters)
+      if (result.ok) {
+        // result now includes trails: {icao24: [[lng,lat],...]}
+        setAirSnapshot({
+          ts:       result.ts,
+          count:    result.count,
+          aircraft: result.aircraft,
+          trails:   result.trails || {},
+        })
+        // Immediately check near AOIs with improved geometry check
+        const near = await fetchAirNearAois()
+        if (near.ok) setAirNearAois(near.results || [])
+        const filterNote = Object.values(filters).filter(Boolean).length
+          ? ' (filtered)' : ''
+        if (result.count > 0) showToast(`${result.count} aircraft loaded${filterNote}`, 'info')
+      } else {
+        showToast(`Air refresh failed: ${result.error}`, 'error')
+      }
+    } catch (e) { showToast(e.message || 'Air refresh failed') }
+  }, [showToast])
+
+  const handleAircraftClick = useCallback((props) => {
+    setSelectedAircraft((prev) => prev?.icao24 === props?.icao24 ? null : props)
+  }, [])
+
+
   const selectedAoi = aois.find((a) => a.id === selectedAoiId) || null
 
   // ── Copy center coords ─────────────────────────────────────────────────────
@@ -289,6 +327,13 @@ export default function App() {
           alerts={alerts}
           onReviewAlert={handleReviewAlert}
           onCheckNow={handleCheckNow}
+          airVisible={airVisible}
+          onToggleAir={() => setAirVisible((v) => !v)}
+          airSnapshot={airSnapshot}
+          airNearAois={airNearAois}
+          onAirRefresh={handleAirRefresh}
+          onAircraftClick={handleAircraftClick}
+          selectedAircraft={selectedAircraft}
         />
 
         <div className={styles.mapContainer}>
@@ -314,6 +359,10 @@ export default function App() {
             drawMode={drawMode}
             onAoiComplete={handleAoiComplete}
             onDrawCancel={() => setDrawMode(null)}
+            aircraft={airSnapshot?.aircraft || []}
+            airTrails={airSnapshot?.trails || {}}
+            airVisible={airVisible}
+            onAircraftClick={handleAircraftClick}
           />
         </div>
 

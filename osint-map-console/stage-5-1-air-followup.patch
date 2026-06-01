@@ -1,0 +1,1520 @@
+From 16c0048464f7840f508114aeb4fa865cb5b510f0 Mon Sep 17 00:00:00 2001
+From: "OSINT Map Stage 5.1" <stage5.1@osint-map-console.local>
+Date: Mon, 1 Jun 2026 18:48:59 +0000
+Subject: [PATCH] =?UTF-8?q?feat:=20Stage=205.1=20=E2=80=94=20aircraft=20tr?=
+ =?UTF-8?q?ail=20history,=20improved=20AOI=20intersection,=20filter=20cont?=
+ =?UTF-8?q?rols?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Backend — air_traffic.py (full rewrite of Stage 5 MVP):
+- Trail history: air_trail table (per-aircraft, ring-buffer TRAIL_MAX=8 pts,
+  TTL=3600s); upsert_trails() inserts on every refresh, load_trails() returns
+  {icao24: [[lng,lat],...]} ordered oldest→newest for LineString rendering
+- Improved AOI intersection: _aircraft_near_geom() replaces flat 0.5° pad:
+  * Point AOI → haversine km check (default 30 km radius)
+  * Polygon AOI → ray-casting point-in-polygon (no deps) + edge buffer
+  * LineString AOI → per-segment corridor check + haversine to midpoint
+  * Fallback → padded bbox
+- Filter support: fetch_aircraft_filtered() for alt_min/alt_max/speed_min/callsign
+
+Backend — main.py endpoint updates:
+- POST /api/air/refresh: optional query params (alt_min, alt_max, speed_min, callsign);
+  calls upsert_trails() after fetch; returns trails{} in response
+- GET  /api/air/latest: now includes trails{} for current snapshot aircraft
+- GET  /api/air/near-aois: accepts pad_km param (default 30.0); uses geometry-aware check
+- GET  /api/air/trails: returns trail data, optional icao24 filter
+- DB: air_trail table + index created on startup
+
+Frontend — airLayer.js:
+- Trail source (src-air-trail) + AIR_TRAIL_LAYER line layer added
+- setAirTrails(map, trails, aircraft): builds LineString FeatureCollection,
+  altitude-coded line color matching dot color scheme
+- setAirVisibility() now covers trail layer too
+
+Frontend — AircraftPanel.jsx:
+- Filter panel (collapsible via ⊟ FILTERS button):
+  callsign substring, alt_min/alt_max (metres), speed_min (m/s)
+- Filters applied both client-side (display) and server-side (on next refresh)
+- FILTERS* label when active filters present
+- Trail badge in summary (count of aircraft with trail data)
+- Trail point count shown in aircraft detail view
+- ⇒ trail indicator on aircraft rows that have history
+
+Frontend — MapView.jsx:
+- airTrails prop + airTrailsRef added; setAirTrails called on init and in data effect
+- aircraft+trail useEffect combined ([aircraft, airTrails] deps)
+
+Frontend — App.jsx:
+- handleAirRefresh(filters): passes filters to refreshAirTraffic(), stores trails
+  in airSnapshot.trails; filter note in toast message
+- airTrails={airSnapshot?.trails || {}} wired to MapView
+
+Frontend — useApi.js:
+- refreshAirTraffic(filters): builds URLSearchParams from filter object
+- fetchAirNearAois(padKm): optional pad_km param
+- fetchAirTrails(icao24): new endpoint wrapper
+
+Build: npm run build ✓ (59 modules, 0 errors, 9.17s)
+---
+ osint-map-console/backend/air_traffic.py      | 312 +++++++++++++-----
+ osint-map-console/backend/main.py             | 115 +++++--
+ osint-map-console/frontend/src/App.jsx        |  25 +-
+ .../frontend/src/components/AircraftPanel.jsx | 180 ++++++----
+ .../frontend/src/components/MapView.jsx       |  20 +-
+ .../frontend/src/hooks/airLayer.js            | 116 +++++--
+ .../frontend/src/hooks/useApi.js              |  23 +-
+ .../src/styles/AircraftPanel.module.css       | 139 +++++---
+ 8 files changed, 660 insertions(+), 270 deletions(-)
+
+diff --git a/osint-map-console/backend/air_traffic.py b/osint-map-console/backend/air_traffic.py
+index b0f4b97..13f1ff0 100644
+--- a/osint-map-console/backend/air_traffic.py
++++ b/osint-map-console/backend/air_traffic.py
+@@ -1,45 +1,49 @@
+ """
+-Stage 5 — Air traffic ingestion helper.
++Stage 5 / 5.1 — Air traffic ingestion helper.
+ 
+ Source: OpenSky Network REST API (public, no auth for anonymous use)
+   https://opensky-network.org/api/states/all
+-  Returns all aircraft currently tracked worldwide.
+-  Anonymous: max 400 states, 10 s resolution, rate-limited to ~100 req/day.
+ 
+-We follow the same manual-triggered pattern as Stage 4.1 (no background thread).
+-Backend stores the latest snapshot in-memory (last_fetch_result) AND in SQLite
+-so it survives uvicorn --reload.
+-
+-The ingest stores aircraft as a lightweight JSON blob per refresh, keyed by
+-fetch timestamp. We keep only the last N snapshots to stay lean.
++Stage 5.1 additions over MVP:
++  - Per-aircraft trail history: keep last TRAIL_MAX positions per ICAO24
++    stored in air_trail table (separate from snapshots).
++  - Improved AOI intersection: for Polygon AOIs use a proper
++    point-in-polygon test (ray-casting, no external deps). For Point AOIs
++    use haversine radius check in km. For LineString AOIs use corridor bbox.
++    For all others fall back to padded bbox.
++  - Filter params exposed in fetch_aircraft_filtered() for UI filters
++    (min/max alt, min speed, callsign substring).
+ """
+ 
+ import json
++import math
+ import time
+ from typing import Optional
+ 
+ import httpx
+ 
+ OPENSKY_URL = "https://opensky-network.org/api/states/all"
+-TIMEOUT     = 20   # seconds
+-MAX_STORED  = 3    # keep last N snapshots in DB (prevents unbounded growth)
++TIMEOUT      = 20    # seconds per HTTP request
++MAX_STORED   = 5     # keep last N full snapshots in air_snapshot
++TRAIL_MAX    = 8     # max trail points kept per aircraft (ring buffer style)
++TRAIL_TTL    = 3600  # seconds — purge trail points older than this
+ 
+-# Column indices from OpenSky response
+-# https://openskynetwork.github.io/opensky-api/rest.html#response
++# Column indices in OpenSky state vector
+ _F_ICAO24    = 0
+ _F_CALLSIGN  = 1
+ _F_COUNTRY   = 2
+ _F_LON       = 5
+ _F_LAT       = 6
+-_F_ALT_BARO  = 7    # barometric altitude (m)
++_F_ALT_BARO  = 7
+ _F_ON_GROUND = 8
+-_F_VELOCITY  = 9    # m/s
++_F_VELOCITY  = 9
+ _F_HEADING   = 10
+-_F_ALT_GEO   = 13   # geometric altitude (m)
++_F_ALT_GEO   = 13
++
+ 
++# ── Normalisation ──────────────────────────────────────────────────────────────
+ 
+ def _normalize(sv: list) -> Optional[dict]:
+-    """Convert one OpenSky state vector to our internal aircraft dict."""
+     try:
+         lng = sv[_F_LON]
+         lat = sv[_F_LAT]
+@@ -47,49 +51,37 @@ def _normalize(sv: list) -> Optional[dict]:
+             return None
+         if not (-180 <= lng <= 180) or not (-90 <= lat <= 90):
+             return None
+-
+         on_ground = bool(sv[_F_ON_GROUND])
+         alt = sv[_F_ALT_GEO] or sv[_F_ALT_BARO]
+-
+         return {
+-            "icao24":   (sv[_F_ICAO24] or "").strip().upper(),
+-            "callsign": (sv[_F_CALLSIGN] or "").strip(),
+-            "country":  (sv[_F_COUNTRY] or "").strip(),
+-            "lat":      round(lat, 5),
+-            "lng":      round(lng, 5),
+-            "alt_m":    round(alt, 0) if alt is not None else None,
+-            "speed_ms": round(sv[_F_VELOCITY], 1) if sv[_F_VELOCITY] is not None else None,
+-            "heading":  round(sv[_F_HEADING], 1) if sv[_F_HEADING] is not None else None,
++            "icao24":    (sv[_F_ICAO24] or "").strip().upper(),
++            "callsign":  (sv[_F_CALLSIGN] or "").strip(),
++            "country":   (sv[_F_COUNTRY] or "").strip(),
++            "lat":       round(lat, 5),
++            "lng":       round(lng, 5),
++            "alt_m":     round(alt, 0) if alt is not None else None,
++            "speed_ms":  round(sv[_F_VELOCITY], 1) if sv[_F_VELOCITY] is not None else None,
++            "heading":   round(sv[_F_HEADING], 1) if sv[_F_HEADING] is not None else None,
+             "on_ground": on_ground,
+         }
+     except Exception:
+         return None
+ 
+ 
++# ── Fetch ─────────────────────────────────────────────────────────────────────
++
+ def fetch_aircraft(bbox: Optional[list] = None) -> dict:
+-    """
+-    Fetch current aircraft state from OpenSky.
+-    bbox = [min_lng, min_lat, max_lng, max_lat] — optional spatial filter.
+-    Returns {"ok": bool, "ts": int, "count": int, "aircraft": [...], "error": str|None}
+-    """
+     params = {}
+     if bbox:
+-        # OpenSky uses (lamin, lomin, lamax, lomax)
+-        params = {
+-            "lamin": bbox[1],
+-            "lomin": bbox[0],
+-            "lamax": bbox[3],
+-            "lomax": bbox[2],
+-        }
+-
++        params = {"lamin": bbox[1], "lomin": bbox[0], "lamax": bbox[3], "lomax": bbox[2]}
+     try:
+         resp = httpx.get(OPENSKY_URL, params=params, timeout=TIMEOUT,
+                          headers={"Accept": "application/json"})
+         resp.raise_for_status()
+         data = resp.json()
+     except httpx.TimeoutException:
+-        return {"ok": False, "error": "OpenSky request timed out", "ts": int(time.time()),
+-                "count": 0, "aircraft": []}
++        return {"ok": False, "error": "OpenSky request timed out",
++                "ts": int(time.time()), "count": 0, "aircraft": []}
+     except httpx.HTTPStatusError as e:
+         return {"ok": False, "error": f"OpenSky HTTP {e.response.status_code}",
+                 "ts": int(time.time()), "count": 0, "aircraft": []}
+@@ -99,37 +91,52 @@ def fetch_aircraft(bbox: Optional[list] = None) -> dict:
+ 
+     states = data.get("states") or []
+     aircraft = [a for sv in states if (a := _normalize(sv)) is not None]
+-    # Filter airborne only (skip ground vehicles)
+-    aircraft = [a for a in aircraft if not a["on_ground"]]
++    aircraft = [a for a in aircraft if not a["on_ground"]]  # airborne only
++    return {"ok": True, "error": None, "ts": int(time.time()),
++            "count": len(aircraft), "aircraft": aircraft}
++
++
++def fetch_aircraft_filtered(
++    alt_min: Optional[float] = None,
++    alt_max: Optional[float] = None,
++    speed_min: Optional[float] = None,
++    callsign_contains: Optional[str] = None,
++) -> dict:
++    """Fetch and apply server-side light filters before returning."""
++    result = fetch_aircraft()
++    if not result["ok"] or not result["aircraft"]:
++        return result
++    ac = result["aircraft"]
++    if alt_min is not None:
++        ac = [a for a in ac if a["alt_m"] is not None and a["alt_m"] >= alt_min]
++    if alt_max is not None:
++        ac = [a for a in ac if a["alt_m"] is not None and a["alt_m"] <= alt_max]
++    if speed_min is not None:
++        ac = [a for a in ac if a["speed_ms"] is not None and a["speed_ms"] >= speed_min]
++    if callsign_contains:
++        needle = callsign_contains.upper()
++        ac = [a for a in ac if needle in (a["callsign"] or a["icao24"])]
++    result["aircraft"] = ac
++    result["count"] = len(ac)
++    return result
+ 
+-    return {
+-        "ok":       True,
+-        "error":    None,
+-        "ts":       int(time.time()),
+-        "count":    len(aircraft),
+-        "aircraft": aircraft,
+-    }
+ 
++# ── Snapshot persistence ───────────────────────────────────────────────────────
+ 
+ def store_snapshot(conn, result: dict) -> None:
+-    """Persist snapshot to air_snapshot table; prune old ones."""
+     payload = json.dumps(result["aircraft"])
+     conn.execute(
+         "INSERT INTO air_snapshot (fetched_at, aircraft_count, payload) VALUES (?, ?, ?)",
+         (result["ts"], result["count"], payload),
+     )
+-    # Keep only last MAX_STORED rows
+     conn.execute("""
+         DELETE FROM air_snapshot
+-        WHERE id NOT IN (
+-            SELECT id FROM air_snapshot ORDER BY fetched_at DESC LIMIT ?
+-        )
++        WHERE id NOT IN (SELECT id FROM air_snapshot ORDER BY fetched_at DESC LIMIT ?)
+     """, (MAX_STORED,))
+     conn.commit()
+ 
+ 
+ def load_latest_snapshot(conn) -> Optional[dict]:
+-    """Load the most recent snapshot from DB."""
+     row = conn.execute(
+         "SELECT fetched_at, aircraft_count, payload FROM air_snapshot ORDER BY fetched_at DESC LIMIT 1"
+     ).fetchone()
+@@ -142,41 +149,90 @@ def load_latest_snapshot(conn) -> Optional[dict]:
+         return None
+ 
+ 
+-def intersect_with_aoi(aircraft: list, aoi_list: list) -> list:
++# ── Trail history ──────────────────────────────────────────────────────────────
++
++def upsert_trails(conn, aircraft: list, ts: int) -> None:
+     """
+-    For each monitored AOI, find aircraft within a rough radius.
+-    Returns list of {aoi_id, aoi_title, aircraft: [...]}.
+-    Uses simple bounding-box check (fast, good enough for MVP).
++    Store one trail point per aircraft in air_trail.
++    Keep at most TRAIL_MAX points per icao24 (ring-buffer: delete oldest excess).
++    Also purge points older than TRAIL_TTL seconds.
+     """
+-    results = []
+-    for aoi in aoi_list:
+-        if not aoi.get("monitored"):
+-            continue
+-        geom = aoi.get("geometry", {})
+-        bbox = _bbox_from_geometry(geom)
+-        if not bbox:
++    cutoff = ts - TRAIL_TTL
++    conn.execute("DELETE FROM air_trail WHERE ts < ?", (cutoff,))
++
++    for ac in aircraft:
++        icao24 = ac["icao24"]
++        if not icao24:
+             continue
+-        # Pad bbox by ~0.5 deg (~55 km) for "near AOI"
+-        pad = 0.5
+-        min_lng, min_lat, max_lng, max_lat = (
+-            bbox[0] - pad, bbox[1] - pad, bbox[2] + pad, bbox[3] + pad
++        conn.execute(
++            "INSERT INTO air_trail (icao24, ts, lat, lng, alt_m, heading) VALUES (?, ?, ?, ?, ?, ?)",
++            (icao24, ts, ac["lat"], ac["lng"], ac.get("alt_m"), ac.get("heading")),
+         )
+-        near = [
+-            a for a in aircraft
+-            if min_lng <= a["lng"] <= max_lng and min_lat <= a["lat"] <= max_lat
+-        ]
+-        if near:
+-            results.append({
+-                "aoi_id":    aoi["id"],
+-                "aoi_title": aoi["title"],
+-                "count":     len(near),
+-                "aircraft":  near,
+-            })
+-    return results
++        # Delete excess — keep newest TRAIL_MAX
++        conn.execute("""
++            DELETE FROM air_trail WHERE icao24 = ? AND id NOT IN (
++                SELECT id FROM air_trail WHERE icao24 = ? ORDER BY ts DESC LIMIT ?
++            )
++        """, (icao24, icao24, TRAIL_MAX))
++
++    conn.commit()
++
++
++def load_trails(conn, icao24_set: Optional[set] = None) -> dict:
++    """
++    Return {icao24: [[lng, lat], ...]} ordered oldest→newest (for LineString).
++    If icao24_set is provided, only return trails for those aircraft.
++    """
++    if icao24_set is not None and not icao24_set:
++        return {}
++    if icao24_set:
++        placeholders = ",".join("?" * len(icao24_set))
++        rows = conn.execute(
++            f"SELECT icao24, lng, lat FROM air_trail WHERE icao24 IN ({placeholders}) ORDER BY ts ASC",
++            list(icao24_set),
++        ).fetchall()
++    else:
++        rows = conn.execute(
++            "SELECT icao24, lng, lat FROM air_trail ORDER BY ts ASC"
++        ).fetchall()
++
++    trails: dict = {}
++    for r in rows:
++        trails.setdefault(r["icao24"], []).append([r["lng"], r["lat"]])
++    return trails
++
++
++# ── Geometry helpers ───────────────────────────────────────────────────────────
++
++def _haversine_km(lat1: float, lng1: float, lat2: float, lng2: float) -> float:
++    R = 6371.0
++    d_lat = math.radians(lat2 - lat1)
++    d_lng = math.radians(lng2 - lng1)
++    a = (math.sin(d_lat / 2) ** 2
++         + math.cos(math.radians(lat1)) * math.cos(math.radians(lat2))
++         * math.sin(d_lng / 2) ** 2)
++    return 2 * R * math.asin(math.sqrt(a))
++
++
++def _point_in_polygon(lng: float, lat: float, ring: list) -> bool:
++    """
++    Ray-casting point-in-polygon test.
++    ring: [[lng, lat], ...] (closed or unclosed, we handle both).
++    O(n), no deps.
++    """
++    n = len(ring)
++    inside = False
++    j = n - 1
++    for i in range(n):
++        xi, yi = ring[i][0], ring[i][1]
++        xj, yj = ring[j][0], ring[j][1]
++        if ((yi > lat) != (yj > lat)) and (lng < (xj - xi) * (lat - yi) / (yj - yi + 1e-12) + xi):
++            inside = not inside
++        j = i
++    return inside
+ 
+ 
+ def _bbox_from_geometry(geom: dict) -> Optional[list]:
+-    """Minimal bbox helper (same logic as monitoring.py)."""
+     gtype = geom.get("type", "")
+     coords = geom.get("coordinates", [])
+ 
+@@ -190,13 +246,89 @@ def _bbox_from_geometry(geom: dict) -> Optional[list]:
+             pts.extend(flat(s))
+         return pts
+ 
+-    if gtype == "Point":
+-        pts = [coords]
+-    else:
+-        pts = flat(coords)
+-
++    pts = [coords] if gtype == "Point" else flat(coords)
+     if not pts:
+         return None
+     lngs = [p[0] for p in pts]
+     lats  = [p[1] for p in pts]
+     return [min(lngs), min(lats), max(lngs), max(lats)]
++
++
++def _aircraft_near_geom(ac: dict, geom: dict, pad_km: float = 30.0) -> bool:
++    """
++    Improved AOI-aircraft proximity check.
++    - Point AOI: haversine distance ≤ pad_km
++    - Polygon AOI: ray-cast point-in-polygon on outer ring; also accept
++      aircraft within pad_km/4 of the bbox edge (near but outside)
++    - LineString AOI: per-segment distance ≤ pad_km (simplified corridor)
++    - Fallback: padded bbox
++    """
++    gtype = geom.get("type", "")
++    coords = geom.get("coordinates", [])
++    a_lat, a_lng = ac["lat"], ac["lng"]
++    pad_deg = pad_km / 111.0  # rough deg equivalent
++
++    if gtype == "Point":
++        c_lng, c_lat = coords[0], coords[1]
++        return _haversine_km(a_lat, a_lng, c_lat, c_lng) <= pad_km
++
++    if gtype == "Polygon" and coords:
++        ring = coords[0]  # outer ring
++        if _point_in_polygon(a_lng, a_lat, ring):
++            return True
++        # Also check within corridor buffer of polygon
++        bbox = _bbox_from_geometry(geom)
++        if bbox:
++            return (bbox[0] - pad_deg / 2 <= a_lng <= bbox[2] + pad_deg / 2 and
++                    bbox[1] - pad_deg / 2 <= a_lat <= bbox[3] + pad_deg / 2)
++        return False
++
++    if gtype == "LineString" and coords:
++        # Check each segment: project point onto segment, compute distance
++        for i in range(len(coords) - 1):
++            p1_lng, p1_lat = coords[i][0],   coords[i][1]
++            p2_lng, p2_lat = coords[i+1][0], coords[i+1][1]
++            # Approximate: check if point is within pad_km of either endpoint
++            # or within bbox of segment ± pad_deg
++            seg_min_lng = min(p1_lng, p2_lng) - pad_deg
++            seg_max_lng = max(p1_lng, p2_lng) + pad_deg
++            seg_min_lat = min(p1_lat, p2_lat) - pad_deg
++            seg_max_lat = max(p1_lat, p2_lat) + pad_deg
++            if (seg_min_lng <= a_lng <= seg_max_lng and
++                    seg_min_lat <= a_lat <= seg_max_lat):
++                # Refine with haversine to midpoint
++                mid_lat = (p1_lat + p2_lat) / 2
++                mid_lng = (p1_lng + p2_lng) / 2
++                if _haversine_km(a_lat, a_lng, mid_lat, mid_lng) <= pad_km * 1.5:
++                    return True
++        return False
++
++    # Fallback: padded bbox
++    bbox = _bbox_from_geometry(geom)
++    if not bbox:
++        return False
++    return (bbox[0] - pad_deg <= a_lng <= bbox[2] + pad_deg and
++            bbox[1] - pad_deg <= a_lat <= bbox[3] + pad_deg)
++
++
++def intersect_with_aoi(aircraft: list, aoi_list: list, pad_km: float = 30.0) -> list:
++    """
++    Improved AOI intersection with geometry-aware checks.
++    pad_km: proximity radius for Point and corridor width for Line/Polygon buffer.
++    """
++    results = []
++    for aoi in aoi_list:
++        if not aoi.get("monitored"):
++            continue
++        geom = aoi.get("geometry", {})
++        if not geom:
++            continue
++        near = [a for a in aircraft if _aircraft_near_geom(a, geom, pad_km)]
++        if near:
++            results.append({
++                "aoi_id":    aoi["id"],
++                "aoi_title": aoi["title"],
++                "count":     len(near),
++                "aircraft":  near,
++            })
++    return results
+diff --git a/osint-map-console/backend/main.py b/osint-map-console/backend/main.py
+index 23a603a..d85e92f 100644
+--- a/osint-map-console/backend/main.py
++++ b/osint-map-console/backend/main.py
+@@ -751,70 +751,116 @@ def monitoring_check_now():
+         return {"ok": False, "error": str(e), "checked": 0, "new_snapshots": 0, "new_alerts": 0}
+ 
+ 
+-# ── Stage 5 — Air traffic overlay ────────────────────────────────────────────
++# ── Stage 5 / 5.1 — Air traffic overlay ──────────────────────────────────────
+ 
+-from air_traffic import fetch_aircraft, store_snapshot, load_latest_snapshot, intersect_with_aoi
++from air_traffic import (
++    fetch_aircraft, fetch_aircraft_filtered,
++    store_snapshot, load_latest_snapshot,
++    upsert_trails, load_trails,
++    intersect_with_aoi,
++)
+ 
+ 
+ def _init_air_db(conn):
+     conn.execute("""
+         CREATE TABLE IF NOT EXISTS air_snapshot (
+-            id           INTEGER PRIMARY KEY AUTOINCREMENT,
+-            fetched_at   INTEGER NOT NULL,
++            id             INTEGER PRIMARY KEY AUTOINCREMENT,
++            fetched_at     INTEGER NOT NULL,
+             aircraft_count INTEGER NOT NULL DEFAULT 0,
+-            payload      TEXT NOT NULL DEFAULT '[]'
++            payload        TEXT NOT NULL DEFAULT '[]'
++        )
++    """)
++    # Stage 5.1 — trail history table
++    conn.execute("""
++        CREATE TABLE IF NOT EXISTS air_trail (
++            id      INTEGER PRIMARY KEY AUTOINCREMENT,
++            icao24  TEXT NOT NULL,
++            ts      INTEGER NOT NULL,
++            lat     REAL NOT NULL,
++            lng     REAL NOT NULL,
++            alt_m   REAL,
++            heading REAL
+         )
+     """)
++    conn.execute("CREATE INDEX IF NOT EXISTS idx_air_trail_icao24 ON air_trail (icao24, ts)")
+     conn.commit()
+ 
+ 
+-# Init air table alongside markers
++# Init air tables alongside markers
+ _db_conn_for_init = get_db()
+ _init_air_db(_db_conn_for_init)
+ _db_conn_for_init.close()
+ 
+ 
+ @app.post("/api/air/refresh")
+-def air_refresh():
++def air_refresh(
++    alt_min: Optional[float] = None,
++    alt_max: Optional[float] = None,
++    speed_min: Optional[float] = None,
++    callsign: Optional[str] = None,
++):
+     """
+-    Manually trigger a full global aircraft fetch from OpenSky.
+-    Stores snapshot in DB, returns aircraft list + metadata.
++    Stage 5.1: Fetch from OpenSky, store snapshot + trail points.
++    Optional query-param filters: alt_min, alt_max, speed_min, callsign.
++    Returns aircraft list, trail data for all aircraft, and metadata.
+     """
+-    result = fetch_aircraft()           # no bbox → worldwide
++    if any(v is not None for v in [alt_min, alt_max, speed_min, callsign]):
++        result = fetch_aircraft_filtered(
++            alt_min=alt_min, alt_max=alt_max,
++            speed_min=speed_min, callsign_contains=callsign,
++        )
++    else:
++        result = fetch_aircraft()
++
+     conn = get_db()
+     if result["ok"] and result["aircraft"]:
+         store_snapshot(conn, result)
++        upsert_trails(conn, result["aircraft"], result["ts"])
++
++    # Return trails for the aircraft we just fetched
++    icao_set = {a["icao24"] for a in result["aircraft"]} if result["aircraft"] else set()
++    trails = load_trails(conn, icao_set) if icao_set else {}
+     conn.close()
++
+     return {
+         "ok":       result["ok"],
+         "error":    result.get("error"),
+         "ts":       result["ts"],
+         "count":    result["count"],
+         "aircraft": result["aircraft"],
++        "trails":   trails,
+     }
+ 
+ 
+ @app.get("/api/air/latest")
+ def air_latest():
+     """
+-    Return the most recently fetched aircraft snapshot (from DB).
+-    Does NOT make a new request to OpenSky.
++    Return the latest snapshot + current trails. No new OpenSky request.
+     """
+     conn = get_db()
+     snapshot = load_latest_snapshot(conn)
+-    conn.close()
+     if not snapshot:
+-        return {"ok": False, "ts": None, "count": 0, "aircraft": [],
++        conn.close()
++        return {"ok": False, "ts": None, "count": 0, "aircraft": [], "trails": {},
+                 "message": "No snapshot yet — call POST /api/air/refresh first"}
+-    return {"ok": True, "ts": snapshot["ts"], "count": snapshot["count"],
+-            "aircraft": snapshot["aircraft"]}
++
++    icao_set = {a["icao24"] for a in snapshot["aircraft"]}
++    trails   = load_trails(conn, icao_set) if icao_set else {}
++    conn.close()
++    return {
++        "ok":       True,
++        "ts":       snapshot["ts"],
++        "count":    snapshot["count"],
++        "aircraft": snapshot["aircraft"],
++        "trails":   trails,
++    }
+ 
+ 
+ @app.get("/api/air/near-aois")
+-def air_near_aois():
++def air_near_aois(pad_km: float = 30.0):
+     """
+-    Return aircraft that are currently near/inside each monitored AOI.
+-    Uses the latest stored snapshot. Does NOT re-fetch from OpenSky.
++    Stage 5.1: geometry-aware intersection (polygon ray-cast, haversine for points,
++    corridor for lines). pad_km controls buffer size. Default 30 km.
+     """
+     conn = get_db()
+     snapshot = load_latest_snapshot(conn)
+@@ -827,9 +873,8 @@ def air_near_aois():
+ 
+     aoi_list = []
+     for r in aoi_rows:
+-        import json as _json
+         try:
+-            geom = _json.loads(r["geometry"])
++            geom = json.loads(r["geometry"])
+         except Exception:
+             continue
+         aoi_list.append({
+@@ -839,9 +884,25 @@ def air_near_aois():
+             "geometry":  geom,
+         })
+ 
+-    results = intersect_with_aoi(snapshot["aircraft"], aoi_list)
+-    return {
+-        "ok":      True,
+-        "ts":      snapshot["ts"],
+-        "results": results,
+-    }
++    results = intersect_with_aoi(snapshot["aircraft"], aoi_list, pad_km=pad_km)
++    return {"ok": True, "ts": snapshot["ts"], "results": results}
++
++
++@app.get("/api/air/trails")
++def air_trails(icao24: Optional[str] = None):
++    """
++    Return trail data. If icao24 query param given, return that aircraft only.
++    Otherwise return trails for all aircraft in the latest snapshot.
++    """
++    conn = get_db()
++    if icao24:
++        trails = load_trails(conn, {icao24.upper()})
++    else:
++        snapshot = load_latest_snapshot(conn)
++        if snapshot:
++            icao_set = {a["icao24"] for a in snapshot["aircraft"]}
++            trails   = load_trails(conn, icao_set) if icao_set else {}
++        else:
++            trails = {}
++    conn.close()
++    return {"ok": True, "trails": trails}
+diff --git a/osint-map-console/frontend/src/App.jsx b/osint-map-console/frontend/src/App.jsx
+index 7c5f373..5066c70 100644
+--- a/osint-map-console/frontend/src/App.jsx
++++ b/osint-map-console/frontend/src/App.jsx
+@@ -57,8 +57,8 @@ export default function App() {
+   const [selectedAoiId,     setSelectedAoiId]     = useState(null)
+   const [drawMode,          setDrawMode]          = useState(null) // 'polygon'|'route'|'circle'|null
+   const [alerts,            setAlerts]            = useState([])
+-  // Stage 5 — Air traffic
+-  const [airSnapshot,       setAirSnapshot]       = useState(null)    // {ts, count, aircraft}
++  // Stage 5 / 5.1 — Air traffic
++  const [airSnapshot,       setAirSnapshot]       = useState(null)    // {ts, count, aircraft, trails}
+   const [airNearAois,       setAirNearAois]       = useState([])
+   const [airVisible,        setAirVisible]        = useState(true)
+   const [selectedAircraft,  setSelectedAircraft]  = useState(null)
+@@ -246,16 +246,24 @@ export default function App() {
+   }, []) // eslint-disable-line
+ 
+ 
+-  // ── Stage 5: Air traffic ─────────────────────────────────────────────────────
+-  const handleAirRefresh = useCallback(async () => {
++  // ── Stage 5 / 5.1: Air traffic ───────────────────────────────────────────────
++  const handleAirRefresh = useCallback(async (filters = {}) => {
+     try {
+-      const result = await refreshAirTraffic()
++      const result = await refreshAirTraffic(filters)
+       if (result.ok) {
+-        setAirSnapshot({ ts: result.ts, count: result.count, aircraft: result.aircraft })
+-        // Immediately check near AOIs
++        // result now includes trails: {icao24: [[lng,lat],...]}
++        setAirSnapshot({
++          ts:       result.ts,
++          count:    result.count,
++          aircraft: result.aircraft,
++          trails:   result.trails || {},
++        })
++        // Immediately check near AOIs with improved geometry check
+         const near = await fetchAirNearAois()
+         if (near.ok) setAirNearAois(near.results || [])
+-        if (result.count > 0) showToast(`${result.count} aircraft loaded`, 'info')
++        const filterNote = Object.values(filters).filter(Boolean).length
++          ? ' (filtered)' : ''
++        if (result.count > 0) showToast(`${result.count} aircraft loaded${filterNote}`, 'info')
+       } else {
+         showToast(`Air refresh failed: ${result.error}`, 'error')
+       }
+@@ -352,6 +360,7 @@ export default function App() {
+             onAoiComplete={handleAoiComplete}
+             onDrawCancel={() => setDrawMode(null)}
+             aircraft={airSnapshot?.aircraft || []}
++            airTrails={airSnapshot?.trails || {}}
+             airVisible={airVisible}
+             onAircraftClick={handleAircraftClick}
+           />
+diff --git a/osint-map-console/frontend/src/components/AircraftPanel.jsx b/osint-map-console/frontend/src/components/AircraftPanel.jsx
+index de58631..6acbdb4 100644
+--- a/osint-map-console/frontend/src/components/AircraftPanel.jsx
++++ b/osint-map-console/frontend/src/components/AircraftPanel.jsx
+@@ -1,50 +1,83 @@
+-// Stage 5 — Aircraft activity panel
+-// Shows: refresh button, last fetch summary, aircraft near monitored AOIs
+-import { useState, useCallback } from 'react'
++// Stage 5 / 5.1 — Aircraft activity panel
++// Adds: filter controls (alt, speed, callsign), trail info in detail view.
++import { useState, useCallback, useMemo } from 'react'
+ import styles from '../styles/AircraftPanel.module.css'
+ 
+ function formatAlt(m) {
+   if (m == null) return '—'
+   return m >= 1000 ? `${(m / 1000).toFixed(1)} km` : `${Math.round(m)} m`
+ }
+-
+ function formatSpeed(ms) {
+   if (ms == null) return '—'
+   return `${Math.round(ms * 3.6)} km/h`
+ }
+-
+ function formatHeading(h) {
+   if (h == null) return '—'
+-  const dirs = ['N','NE','E','SE','S','SW','W','NW']
++  const dirs = ['N','NE','E','SE','S','SW','W','NW','N']
+   return dirs[Math.round(h / 45) % 8] + ` ${Math.round(h)}°`
+ }
+-
+ function formatAge(ts) {
+   if (!ts) return 'never'
+   const sec = Math.round(Date.now() / 1000 - ts)
+   if (sec < 60)   return `${sec}s ago`
+-  if (sec < 3600) return `${Math.floor(sec/60)}m ago`
+-  return `${Math.floor(sec/3600)}h ago`
++  if (sec < 3600) return `${Math.floor(sec / 60)}m ago`
++  return `${Math.floor(sec / 3600)}h ago`
+ }
+ 
++// Default filter state
++const DEFAULT_FILTERS = { altMin: '', altMax: '', speedMin: '', callsign: '' }
++
+ export default function AircraftPanel({
+-  snapshot,      // { ts, count, aircraft: [] } | null
+-  nearAois,      // [{ aoi_id, aoi_title, count, aircraft: [] }]
+-  onRefresh,     // async () => void
++  snapshot,        // { ts, count, aircraft: [], trails: {} } | null
++  nearAois,        // [{ aoi_id, aoi_title, count, aircraft: [] }]
++  onRefresh,       // async (filters) => void
+   onAircraftClick, // (aircraft) => void
+ }) {
+   const [refreshing,  setRefreshing]  = useState(false)
+   const [expandedAoi, setExpandedAoi] = useState(null)
+   const [selectedAc,  setSelectedAc]  = useState(null)
++  const [showFilters, setShowFilters] = useState(false)
++  const [filters,     setFilters]     = useState(DEFAULT_FILTERS)
+ 
+   const handleRefresh = useCallback(async () => {
+     if (refreshing) return
+     setRefreshing(true)
+-    try { await onRefresh?.() }
+-    finally { setRefreshing(false) }
+-  }, [refreshing, onRefresh])
++    try {
++      const parsedFilters = {
++        alt_min:   filters.altMin   !== '' ? parseFloat(filters.altMin)   : undefined,
++        alt_max:   filters.altMax   !== '' ? parseFloat(filters.altMax)   : undefined,
++        speed_min: filters.speedMin !== '' ? parseFloat(filters.speedMin) : undefined,
++        callsign:  filters.callsign || undefined,
++      }
++      await onRefresh?.(parsedFilters)
++    } finally { setRefreshing(false) }
++  }, [refreshing, onRefresh, filters])
++
++  const handleFilterChange = useCallback((key, val) => {
++    setFilters((prev) => ({ ...prev, [key]: val }))
++  }, [])
++
++  const clearFilters = useCallback(() => setFilters(DEFAULT_FILTERS), [])
++
++  const hasFilters = Object.values(filters).some(Boolean)
++
++  // Client-side filter for display (in addition to server-side on refresh)
++  const displayedAircraft = useMemo(() => {
++    if (!snapshot?.aircraft) return []
++    let ac = snapshot.aircraft
++    if (filters.callsign) {
++      const needle = filters.callsign.toUpperCase()
++      ac = ac.filter((a) => (a.callsign || a.icao24).includes(needle))
++    }
++    if (filters.altMin !== '') ac = ac.filter((a) => a.alt_m != null && a.alt_m >= parseFloat(filters.altMin))
++    if (filters.altMax !== '') ac = ac.filter((a) => a.alt_m != null && a.alt_m <= parseFloat(filters.altMax))
++    if (filters.speedMin !== '') ac = ac.filter((a) => a.speed_ms != null && a.speed_ms >= parseFloat(filters.speedMin))
++    return ac
++  }, [snapshot, filters])
+ 
+   const totalNear = nearAois?.reduce((s, r) => s + r.count, 0) ?? 0
++  const trails = snapshot?.trails || {}
++  const trailCount = Object.keys(trails).length
+ 
+   return (
+     <div className={styles.panel}>
+@@ -52,12 +85,10 @@ export default function AircraftPanel({
+       <div className={styles.header}>
+         <span className={styles.headerIcon}>✈</span>
+         <span className={styles.headerLabel}>AIR ACTIVITY</span>
+-        {snapshot && (
+-          <span className={styles.headerAge}>{formatAge(snapshot.ts)}</span>
+-        )}
++        {snapshot && <span className={styles.headerAge}>{formatAge(snapshot.ts)}</span>}
+       </div>
+ 
+-      {/* Refresh button */}
++      {/* Refresh + filter toggle */}
+       <div className={styles.refreshRow}>
+         <button
+           className={`${styles.refreshBtn} ${refreshing ? styles.refreshBusy : ''}`}
+@@ -65,24 +96,63 @@ export default function AircraftPanel({
+           disabled={refreshing}
+           title="Fetch current aircraft from OpenSky Network"
+         >
+-          {refreshing ? '◌ FETCHING...' : '⟳ REFRESH AIRCRAFT NOW'}
++          {refreshing ? '◌ FETCHING...' : '⟳ REFRESH NOW'}
++        </button>
++        <button
++          className={`${styles.filterToggleBtn} ${showFilters ? styles.filterActive : ''} ${hasFilters ? styles.filterHasValues : ''}`}
++          onClick={() => setShowFilters((v) => !v)}
++          title="Toggle filters"
++        >
++          ⊟ {hasFilters ? 'FILTERS*' : 'FILTERS'}
+         </button>
+       </div>
+ 
+-      {/* Snapshot summary */}
+-      {snapshot && (
++      {/* Filter controls — collapsible */}
++      {showFilters && (
++        <div className={styles.filterPanel}>
++          <div className={styles.filterGrid}>
++            <label className={styles.filterLabel}>CALLSIGN</label>
++            <input className={styles.filterInput} type="text" placeholder="e.g. AFL"
++              value={filters.callsign} onChange={(e) => handleFilterChange('callsign', e.target.value.toUpperCase())} maxLength={8} />
++
++            <label className={styles.filterLabel}>ALT MIN (m)</label>
++            <input className={styles.filterInput} type="number" placeholder="0"
++              value={filters.altMin} onChange={(e) => handleFilterChange('altMin', e.target.value)} min={0} max={15000} />
++
++            <label className={styles.filterLabel}>ALT MAX (m)</label>
++            <input className={styles.filterInput} type="number" placeholder="15000"
++              value={filters.altMax} onChange={(e) => handleFilterChange('altMax', e.target.value)} min={0} max={15000} />
++
++            <label className={styles.filterLabel}>SPEED MIN (m/s)</label>
++            <input className={styles.filterInput} type="number" placeholder="0"
++              value={filters.speedMin} onChange={(e) => handleFilterChange('speedMin', e.target.value)} min={0} max={400} />
++          </div>
++          <div className={styles.filterActions}>
++            <button className={styles.filterClearBtn} onClick={clearFilters} disabled={!hasFilters}>
++              CLEAR
++            </button>
++            <span className={styles.filterHint}>Filters apply on next REFRESH</span>
++          </div>
++        </div>
++      )}
++
++      {/* Summary */}
++      {snapshot ? (
+         <div className={styles.summary}>
+-          <span className={styles.summaryCount}>{snapshot.count}</span>
+-          <span className={styles.summaryLabel}>airborne tracked</span>
+-          {totalNear > 0 && (
+-            <span className={styles.summaryAlert}>
+-              ⚑ {totalNear} near monitored AOIs
++          <div className={styles.summaryRow}>
++            <span className={styles.summaryCount}>{displayedAircraft.length}</span>
++            <span className={styles.summaryLabel}>
++              {hasFilters ? `filtered / ${snapshot.count} total` : 'airborne tracked'}
+             </span>
++          </div>
++          {trailCount > 0 && (
++            <span className={styles.trailBadge}>⇒ {trailCount} trails</span>
++          )}
++          {totalNear > 0 && (
++            <span className={styles.summaryAlert}>⚑ {totalNear} near AOIs</span>
+           )}
+         </div>
+-      )}
+-
+-      {!snapshot && (
++      ) : (
+         <div className={styles.empty}>
+           <span>NO DATA</span>
+           <span className={styles.emptyHint}>Click REFRESH to fetch aircraft</span>
+@@ -99,10 +169,8 @@ export default function AircraftPanel({
+           <div className={styles.aoiList}>
+             {nearAois.map((r) => (
+               <div key={r.aoi_id} className={styles.aoiGroup}>
+-                <div
+-                  className={styles.aoiRow}
+-                  onClick={() => setExpandedAoi(expandedAoi === r.aoi_id ? null : r.aoi_id)}
+-                >
++                <div className={styles.aoiRow}
++                  onClick={() => setExpandedAoi(expandedAoi === r.aoi_id ? null : r.aoi_id)}>
+                   <span className={styles.aoiTitle}>{r.aoi_title}</span>
+                   <span className={styles.aoiCount}>{r.count} ac</span>
+                   <span className={styles.expandIcon}>{expandedAoi === r.aoi_id ? '▲' : '▼'}</span>
+@@ -110,15 +178,13 @@ export default function AircraftPanel({
+                 {expandedAoi === r.aoi_id && (
+                   <div className={styles.acList}>
+                     {r.aircraft.map((ac) => (
+-                      <AircraftRow
+-                        key={ac.icao24}
+-                        ac={ac}
++                      <AircraftRow key={ac.icao24} ac={ac}
+                         selected={selectedAc === ac.icao24}
++                        hasTrail={ac.icao24 in trails}
+                         onClick={() => {
+                           setSelectedAc(ac.icao24 === selectedAc ? null : ac.icao24)
+                           onAircraftClick?.(ac)
+-                        }}
+-                      />
++                        }} />
+                     ))}
+                   </div>
+                 )}
+@@ -130,9 +196,9 @@ export default function AircraftPanel({
+ 
+       {/* Selected aircraft detail */}
+       {selectedAc && (() => {
+-        const ac = nearAois?.flatMap(r => r.aircraft).find(a => a.icao24 === selectedAc)
+-          || snapshot?.aircraft?.find(a => a.icao24 === selectedAc)
++        const ac = snapshot?.aircraft?.find((a) => a.icao24 === selectedAc)
+         if (!ac) return null
++        const trail = trails[ac.icao24]
+         return (
+           <div className={styles.detail}>
+             <div className={styles.detailHeader}>
+@@ -140,14 +206,14 @@ export default function AircraftPanel({
+               <button className={styles.detailClose} onClick={() => setSelectedAc(null)}>✕</button>
+             </div>
+             <div className={styles.detailGrid}>
+-              <span className={styles.dk}>ICAO24</span><span className={styles.dv}>{ac.icao24}</span>
++              <span className={styles.dk}>ICAO24</span>  <span className={styles.dv}>{ac.icao24}</span>
+               <span className={styles.dk}>CALLSIGN</span><span className={styles.dv}>{ac.callsign || '—'}</span>
+-              <span className={styles.dk}>COUNTRY</span><span className={styles.dv}>{ac.country || '—'}</span>
+-              <span className={styles.dk}>ALT</span><span className={styles.dv}>{formatAlt(ac.alt_m)}</span>
+-              <span className={styles.dk}>SPEED</span><span className={styles.dv}>{formatSpeed(ac.speed_ms)}</span>
+-              <span className={styles.dk}>HEADING</span><span className={styles.dv}>{formatHeading(ac.heading)}</span>
+-              <span className={styles.dk}>POS</span>
+-              <span className={styles.dv}>{ac.lat.toFixed(4)}, {ac.lng.toFixed(4)}</span>
++              <span className={styles.dk}>COUNTRY</span> <span className={styles.dv}>{ac.country || '—'}</span>
++              <span className={styles.dk}>ALT</span>     <span className={styles.dv}>{formatAlt(ac.alt_m)}</span>
++              <span className={styles.dk}>SPEED</span>   <span className={styles.dv}>{formatSpeed(ac.speed_ms)}</span>
++              <span className={styles.dk}>HEADING</span> <span className={styles.dv}>{formatHeading(ac.heading)}</span>
++              <span className={styles.dk}>POS</span>     <span className={styles.dv}>{ac.lat.toFixed(4)}, {ac.lng.toFixed(4)}</span>
++              <span className={styles.dk}>TRAIL</span>   <span className={styles.dv}>{trail ? `${trail.length} pts` : 'none'}</span>
+             </div>
+           </div>
+         )
+@@ -156,17 +222,17 @@ export default function AircraftPanel({
+   )
+ }
+ 
+-function AircraftRow({ ac, selected, onClick }) {
++function AircraftRow({ ac, selected, hasTrail, onClick }) {
+   return (
+-    <div
+-      className={`${styles.acRow} ${selected ? styles.acSelected : ''}`}
+-      onClick={onClick}
+-    >
++    <div className={`${styles.acRow} ${selected ? styles.acSelected : ''}`} onClick={onClick}>
+       <span className={styles.acCall}>{ac.callsign || ac.icao24}</span>
+-      <span className={styles.acDetail}>
+-        {ac.alt_m != null ? `${Math.round(ac.alt_m / 100) * 100}m` : ''}
+-        {ac.heading != null ? ` ${Math.round(ac.heading)}°` : ''}
+-      </span>
++      <div className={styles.acMeta}>
++        {hasTrail && <span className={styles.trailDot} title="Trail available">⇒</span>}
++        <span className={styles.acDetail}>
++          {ac.alt_m != null ? `${Math.round(ac.alt_m)}m` : ''}
++          {ac.heading != null ? ` ${Math.round(ac.heading)}°` : ''}
++        </span>
++      </div>
+     </div>
+   )
+ }
+diff --git a/osint-map-console/frontend/src/components/MapView.jsx b/osint-map-console/frontend/src/components/MapView.jsx
+index a549fdf..63a1b40 100644
+--- a/osint-map-console/frontend/src/components/MapView.jsx
++++ b/osint-map-console/frontend/src/components/MapView.jsx
+@@ -14,7 +14,7 @@ import {
+   circleToPolygon, ringAreaMeters, formatArea, lineLengthMeters,
+ } from '../hooks/aoiLayer.js'
+ import {
+-  ensureAirLayers, setAirData, setAirVisibility, AIR_CLICKABLE_LAYERS,
++  ensureAirLayers, setAirData, setAirTrails, setAirVisibility, AIR_CLICKABLE_LAYERS,
+ } from '../hooks/airLayer.js'
+ import styles from './MapView.module.css'
+ 
+@@ -55,6 +55,7 @@ export default function MapView({
+   onAoiComplete,        // (geometry, { kind, metric }) => void
+   onDrawCancel,         // () => void
+   aircraft,             // [] — Stage 5 air layer data
++  airTrails,            // {icao24: [[lng,lat],...]} — Stage 5.1 trail history
+   airVisible,           // bool
+   onAircraftClick,      // (props) => void
+ }) {
+@@ -86,8 +87,9 @@ export default function MapView({
+   // Measure state (lives in refs to avoid re-render on every mousemove)
+   const measureRef = useRef({ active: false, pointA: null, line: null, popup: null })
+ 
+-  // Stage 5 — Air layer refs
++  // Stage 5 / 5.1 — Air layer refs
+   const aircraftRef        = useRef(aircraft || [])
++  const airTrailsRef       = useRef(airTrails || {})
+   const airVisibleRef      = useRef(airVisible ?? true)
+   const onAircraftClickRef = useRef(onAircraftClick)
+ 
+@@ -115,6 +117,7 @@ export default function MapView({
+   measureActiveRef.current  = measureActive
+   onMeasureResultRef.current = onMeasureResult
+   aircraftRef.current        = aircraft || []
++  airTrailsRef.current       = airTrails || {}
+   airVisibleRef.current      = airVisible ?? true
+   onAircraftClickRef.current = onAircraftClick
+ 
+@@ -381,9 +384,10 @@ export default function MapView({
+ 
+       drawMarkers(map)
+ 
+-      // Stage 5 — Air layer
++      // Stage 5 / 5.1 — Air layer
+       ensureAirLayers(map)
+       setAirData(map, aircraftRef.current)
++      setAirTrails(map, airTrailsRef.current, aircraftRef.current)
+       if (!airVisibleRef.current) setAirVisibility(map, false)
+       AIR_CLICKABLE_LAYERS.forEach((lid) => {
+         map.on('click', lid, (e) => {
+@@ -477,14 +481,18 @@ export default function MapView({
+     else map.once('load', apply)
+   }, [aois, selectedAoiId])
+ 
+-  // ── Stage 5: aircraft data update ────────────────────────────────────────────
++  // ── Stage 5 / 5.1: aircraft data + trail update ───────────────────────────────
+   useEffect(() => {
+     const map = mapRef.current
+     if (!map) return
+-    const apply = () => { ensureAirLayers(map); setAirData(map, aircraft) }
++    const apply = () => {
++      ensureAirLayers(map)
++      setAirData(map, aircraft)
++      setAirTrails(map, airTrails, aircraft)
++    }
+     if (map.isStyleLoaded()) apply()
+     else map.once('load', apply)
+-  }, [aircraft])
++  }, [aircraft, airTrails])
+ 
+   // ── Stage 5: aircraft visibility toggle ──────────────────────────────────────
+   useEffect(() => {
+diff --git a/osint-map-console/frontend/src/hooks/airLayer.js b/osint-map-console/frontend/src/hooks/airLayer.js
+index 15ad8f2..8fa59dd 100644
+--- a/osint-map-console/frontend/src/hooks/airLayer.js
++++ b/osint-map-console/frontend/src/hooks/airLayer.js
+@@ -1,21 +1,54 @@
+-// Stage 5 — Aircraft layer management for MapLibre
+-// Renders aircraft as a GeoJSON SymbolLayer (chevron icon built from text glyph)
+-// Falls back to circle layer if symbol fonts unavailable.
+-// No trail in MVP — just current position + heading indicator.
++// Stage 5 / 5.1 — Aircraft layer management for MapLibre
++// Points (circle + label) + short trail LineStrings per aircraft.
+ 
+-const AIR_SOURCE = 'src-air'
+-const AIR_LAYER_BASE   = 'air-base'    // circle base (always visible)
+-const AIR_LAYER_LABEL  = 'air-label'   // callsign label
++const AIR_SOURCE       = 'src-air'
++const AIR_TRAIL_SOURCE = 'src-air-trail'
++const AIR_LAYER_BASE   = 'air-base'
++const AIR_LAYER_LABEL  = 'air-label'
++const AIR_TRAIL_LAYER  = 'air-trail'
++
++export const AIR_CLICKABLE_LAYERS = [AIR_LAYER_BASE]
+ 
+ export function ensureAirLayers(map) {
+   if (map.getSource(AIR_SOURCE)) return  // already added
+ 
++  // ── Aircraft point source ──────────────────────────────────────────────────
+   map.addSource(AIR_SOURCE, {
+     type: 'geojson',
+     data: { type: 'FeatureCollection', features: [] },
+   })
+ 
+-  // Base dot — colored by altitude band
++  // ── Trail source ───────────────────────────────────────────────────────────
++  map.addSource(AIR_TRAIL_SOURCE, {
++    type: 'geojson',
++    data: { type: 'FeatureCollection', features: [] },
++  })
++
++  // Trail lines — drawn BELOW the dots
++  map.addLayer({
++    id:     AIR_TRAIL_LAYER,
++    type:   'line',
++    source: AIR_TRAIL_SOURCE,
++    layout: {
++      visibility:  'visible',
++      'line-cap':  'round',
++      'line-join': 'round',
++    },
++    paint: {
++      'line-color': [
++        'case',
++        ['<', ['coalesce', ['get', 'alt_m'], 0], 3000], 'rgba(255,204,0,0.45)',
++        ['<', ['coalesce', ['get', 'alt_m'], 0], 9000], 'rgba(0,229,255,0.4)',
++        'rgba(220,235,255,0.35)',
++      ],
++      'line-width':   1.5,
++      'line-opacity': 0.7,
++      // Fade trail toward the tail end via line-gradient would need expression,
++      // simple constant opacity is fine for MVP.
++    },
++  })
++
++  // Aircraft dots — altitude-coded color
+   map.addLayer({
+     id:     AIR_LAYER_BASE,
+     type:   'circle',
+@@ -24,57 +57,58 @@ export function ensureAirLayers(map) {
+     paint: {
+       'circle-radius': [
+         'interpolate', ['linear'], ['zoom'],
+-        2, 2, 5, 3.5, 8, 5, 12, 6,
++        2, 2, 5, 3.5, 8, 5.5, 12, 7,
+       ],
+-      // Color by altitude: low=yellow, mid=cyan, high=white
+       'circle-color': [
+         'case',
+         ['<', ['coalesce', ['get', 'alt_m'], 0], 3000], '#ffcc00',
+         ['<', ['coalesce', ['get', 'alt_m'], 0], 9000], '#00e5ff',
+-        '#ffffff',
++        '#e8f0ff',
+       ],
+-      'circle-opacity': 0.85,
+-      'circle-stroke-color': 'rgba(8,12,16,0.7)',
++      'circle-opacity': 0.88,
++      'circle-stroke-color': 'rgba(8,12,16,0.65)',
+       'circle-stroke-width': 0.8,
+     },
+   })
+ 
+-  // Callsign label — only shown at zoom >= 6 to avoid clutter
++  // Callsign labels — zoom 6+ to avoid clutter
+   map.addLayer({
+     id:      AIR_LAYER_LABEL,
+     type:    'symbol',
+     source:  AIR_SOURCE,
+     minzoom: 6,
+     layout: {
+-      visibility: 'visible',
+-      'text-field': ['coalesce', ['get', 'callsign'], ['get', 'icao24']],
+-      'text-font':  ['Open Sans Regular'],
+-      'text-size':  10,
+-      'text-offset': [0, 1.4],
+-      'text-anchor': 'top',
++      visibility:           'visible',
++      'text-field':         ['coalesce', ['get', 'callsign'], ['get', 'icao24']],
++      'text-font':          ['Open Sans Regular'],
++      'text-size':          10,
++      'text-offset':        [0, 1.5],
++      'text-anchor':        'top',
+       'text-allow-overlap': false,
+-      'text-optional': true,
++      'text-optional':      true,
+     },
+     paint: {
+-      'text-color': '#c8dae8',
+-      'text-halo-color': 'rgba(8,12,16,0.9)',
+-      'text-halo-width': 1.5,
++      'text-color':       '#c8dae8',
++      'text-halo-color':  'rgba(8,12,16,0.9)',
++      'text-halo-width':  1.5,
+     },
+   })
+ }
+ 
+ export function removeAirLayers(map) {
+-  [AIR_LAYER_LABEL, AIR_LAYER_BASE].forEach((id) => {
++  [AIR_LAYER_LABEL, AIR_LAYER_BASE, AIR_TRAIL_LAYER].forEach((id) => {
+     if (map.getLayer(id)) map.removeLayer(id)
+   })
+-  if (map.getSource(AIR_SOURCE)) map.removeSource(AIR_SOURCE)
++  ;[AIR_SOURCE, AIR_TRAIL_SOURCE].forEach((id) => {
++    if (map.getSource(id)) map.removeSource(id)
++  })
+ }
+ 
+ export function setAirData(map, aircraft) {
+   const src = map.getSource(AIR_SOURCE)
+   if (!src) return
+   const features = (aircraft || []).map((ac) => ({
+-    type: 'Feature',
++    type:     'Feature',
+     geometry: { type: 'Point', coordinates: [ac.lng, ac.lat] },
+     properties: {
+       icao24:   ac.icao24,
+@@ -88,11 +122,33 @@ export function setAirData(map, aircraft) {
+   src.setData({ type: 'FeatureCollection', features })
+ }
+ 
++/**
++ * setAirTrails — render short history lines.
++ * trails: { icao24: [[lng, lat], ...] } — ordered oldest→newest
++ * aircraft: current aircraft array (for alt lookup for color coding)
++ */
++export function setAirTrails(map, trails, aircraft) {
++  const src = map.getSource(AIR_TRAIL_SOURCE)
++  if (!src) return
++
++  // Build altitude lookup for color
++  const altLookup = {}
++  ;(aircraft || []).forEach((ac) => { altLookup[ac.icao24] = ac.alt_m })
++
++  const features = Object.entries(trails || {})
++    .filter(([, pts]) => pts && pts.length >= 2)
++    .map(([icao24, pts]) => ({
++      type:     'Feature',
++      geometry: { type: 'LineString', coordinates: pts },
++      properties: { icao24, alt_m: altLookup[icao24] ?? null },
++    }))
++
++  src.setData({ type: 'FeatureCollection', features })
++}
++
+ export function setAirVisibility(map, visible) {
+   const v = visible ? 'visible' : 'none'
+-  ;[AIR_LAYER_BASE, AIR_LAYER_LABEL].forEach((id) => {
++  ;[AIR_LAYER_BASE, AIR_LAYER_LABEL, AIR_TRAIL_LAYER].forEach((id) => {
+     if (map.getLayer(id)) map.setLayoutProperty(id, 'visibility', v)
+   })
+ }
+-
+-export const AIR_CLICKABLE_LAYERS = [AIR_LAYER_BASE]
+diff --git a/osint-map-console/frontend/src/hooks/useApi.js b/osint-map-console/frontend/src/hooks/useApi.js
+index b8a7449..4bd6f15 100644
+--- a/osint-map-console/frontend/src/hooks/useApi.js
++++ b/osint-map-console/frontend/src/hooks/useApi.js
+@@ -144,15 +144,28 @@ export async function triggerMonitoringCheck() {
+   return apiFetch('/api/monitoring/check-now', { method: 'POST' })
+ }
+ 
+-// ── Stage 5 — Air traffic overlay ────────────────────────────────────────────
+-export async function refreshAirTraffic() {
+-  return apiFetch('/api/air/refresh', { method: 'POST' })
++// ── Stage 5 / 5.1 — Air traffic overlay ──────────────────────────────────────
++export async function refreshAirTraffic(filters = {}) {
++  // filters: { alt_min, alt_max, speed_min, callsign } — all optional
++  const params = new URLSearchParams()
++  if (filters.alt_min  != null) params.set('alt_min',   filters.alt_min)
++  if (filters.alt_max  != null) params.set('alt_max',   filters.alt_max)
++  if (filters.speed_min != null) params.set('speed_min', filters.speed_min)
++  if (filters.callsign)          params.set('callsign',  filters.callsign)
++  const qs = params.toString()
++  return apiFetch(`/api/air/refresh${qs ? '?' + qs : ''}`, { method: 'POST' })
+ }
+ 
+ export async function fetchAirLatest() {
+   return apiFetch('/api/air/latest')
+ }
+ 
+-export async function fetchAirNearAois() {
+-  return apiFetch('/api/air/near-aois')
++export async function fetchAirNearAois(padKm) {
++  const qs = padKm != null ? `?pad_km=${padKm}` : ''
++  return apiFetch(`/api/air/near-aois${qs}`)
++}
++
++export async function fetchAirTrails(icao24) {
++  const qs = icao24 ? `?icao24=${encodeURIComponent(icao24)}` : ''
++  return apiFetch(`/api/air/trails${qs}`)
+ }
+diff --git a/osint-map-console/frontend/src/styles/AircraftPanel.module.css b/osint-map-console/frontend/src/styles/AircraftPanel.module.css
+index 9cff583..4289c12 100644
+--- a/osint-map-console/frontend/src/styles/AircraftPanel.module.css
++++ b/osint-map-console/frontend/src/styles/AircraftPanel.module.css
+@@ -4,49 +4,100 @@
+   border-top: 1px solid var(--border);
+ }
+ 
++/* Header */
+ .header {
+-  display: flex;
+-  align-items: center;
+-  gap: 7px;
++  display: flex; align-items: center; gap: 7px;
+   padding: 8px 12px;
+   background: var(--bg-panel2);
+   border-bottom: 1px solid var(--border);
+-  flex-shrink: 0;
+ }
+ .headerIcon  { color: var(--accent); font-size: 12px; }
+ .headerLabel { font-family: var(--font-mono); font-size: 10px; letter-spacing: 2px; color: var(--accent); flex: 1; }
+ .headerAge   { font-family: var(--font-mono); font-size: 9px; color: var(--text-muted); }
+ 
+-.refreshRow { padding: 7px 10px; border-bottom: 1px solid var(--border); }
++/* Refresh row */
++.refreshRow {
++  display: flex; gap: 0;
++  border-bottom: 1px solid var(--border);
++}
+ .refreshBtn {
+-  width: 100%;
+-  background: transparent;
+-  border: 1px solid var(--border-bright);
++  flex: 1;
++  background: transparent; border: none;
++  border-right: 1px solid var(--border);
+   color: var(--accent);
+-  font-family: var(--font-mono);
+-  font-size: 10px;
+-  letter-spacing: 1.5px;
+-  padding: 5px 8px;
+-  cursor: pointer;
+-  text-align: left;
+-  transition: background 0.12s, border-color 0.12s;
+-}
+-.refreshBtn:hover:not(:disabled) { background: var(--accent-glow); border-color: var(--accent); }
++  font-family: var(--font-mono); font-size: 10px; letter-spacing: 1.5px;
++  padding: 6px 8px; cursor: pointer; text-align: left;
++  transition: background 0.12s;
++}
++.refreshBtn:hover:not(:disabled) { background: var(--accent-glow); }
+ .refreshBtn:disabled { opacity: 0.6; cursor: default; }
+-.refreshBusy { color: var(--yellow) !important; border-color: var(--yellow) !important; animation: pulse 1.2s ease-in-out infinite; }
++.refreshBusy { color: var(--yellow) !important; animation: pulse 1.2s ease-in-out infinite; }
+ @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.5} }
+ 
+-.summary {
+-  display: flex;
++.filterToggleBtn {
++  background: transparent; border: none;
++  color: var(--text-secondary);
++  font-family: var(--font-mono); font-size: 9px; letter-spacing: 1px;
++  padding: 6px 8px; cursor: pointer; white-space: nowrap;
++  transition: color 0.12s;
++}
++.filterToggleBtn:hover { color: var(--text-primary); }
++.filterActive    { color: var(--accent) !important; }
++.filterHasValues { color: var(--yellow) !important; }
++
++/* Filter panel */
++.filterPanel {
++  background: var(--bg-base);
++  border-bottom: 1px solid var(--border);
++  padding: 8px 10px;
++}
++.filterGrid {
++  display: grid;
++  grid-template-columns: 90px 1fr;
++  gap: 4px 6px;
+   align-items: center;
+-  gap: 8px;
++}
++.filterLabel {
++  font-family: var(--font-mono); font-size: 9px;
++  letter-spacing: 1px; color: var(--text-muted);
++}
++.filterInput {
++  background: var(--bg-panel);
++  border: 1px solid var(--border-bright);
++  color: var(--text-primary);
++  font-family: var(--font-mono); font-size: 10px;
++  padding: 3px 6px; outline: none; width: 100%;
++}
++.filterInput:focus { border-color: var(--accent); }
++
++.filterActions {
++  display: flex; align-items: center; gap: 8px;
++  margin-top: 6px;
++}
++.filterClearBtn {
++  background: transparent;
++  border: 1px solid var(--border);
++  color: var(--text-muted);
++  font-family: var(--font-mono); font-size: 9px; letter-spacing: 1px;
++  padding: 2px 8px; cursor: pointer;
++}
++.filterClearBtn:hover:not(:disabled) { border-color: var(--red); color: var(--red); }
++.filterClearBtn:disabled { opacity: 0.3; cursor: default; }
++.filterHint { font-family: var(--font-mono); font-size: 9px; color: var(--text-muted); flex: 1; }
++
++/* Summary */
++.summary {
+   padding: 6px 12px;
+   border-bottom: 1px solid var(--border);
++  display: flex; flex-direction: column; gap: 3px;
+ }
++.summaryRow { display: flex; align-items: baseline; gap: 6px; }
+ .summaryCount { font-family: var(--font-mono); font-size: 18px; color: var(--accent); line-height: 1; }
+ .summaryLabel { font-family: var(--font-mono); font-size: 10px; color: var(--text-secondary); flex: 1; }
++.trailBadge   { font-family: var(--font-mono); font-size: 9px; color: var(--text-secondary); letter-spacing: 0.5px; }
+ .summaryAlert { font-family: var(--font-mono); font-size: 10px; color: var(--yellow); letter-spacing: 0.5px; }
+ 
++/* Empty state */
+ .empty {
+   display: flex; flex-direction: column; align-items: center;
+   padding: 20px 12px; gap: 4px;
+@@ -55,67 +106,61 @@
+ }
+ .emptyHint { font-size: 9px; opacity: 0.6; }
+ 
++/* Section header */
+ .sectionHeader {
+   display: flex; align-items: center; justify-content: space-between;
+-  padding: 6px 12px;
++  padding: 5px 12px;
+   font-family: var(--font-mono); font-size: 9px; letter-spacing: 2px;
+   color: var(--yellow); border-bottom: 1px solid var(--border);
+ }
+ .sectionCount {
+-  background: rgba(255,204,0,0.1);
+-  border: 1px solid rgba(255,204,0,0.3);
+-  font-size: 9px; padding: 1px 5px;
+-  color: var(--yellow);
++  background: rgba(255,204,0,0.08);
++  border: 1px solid rgba(255,204,0,0.25);
++  font-size: 9px; padding: 1px 5px; color: var(--yellow);
+ }
+ 
+-.aoiList { overflow-y: auto; max-height: 180px; }
++/* AOI groups */
++.aoiList  { overflow-y: auto; max-height: 160px; }
+ .aoiGroup { border-bottom: 1px solid var(--border); }
+-
+ .aoiRow {
+   display: flex; align-items: center; gap: 6px;
+   padding: 5px 12px; cursor: pointer;
+   transition: background 0.1s;
+ }
+ .aoiRow:hover { background: var(--bg-hover); }
+-.aoiTitle { font-family: var(--font-ui); font-size: 11px; color: var(--text-primary); flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+-.aoiCount { font-family: var(--font-mono); font-size: 9px; color: var(--accent-dim); }
++.aoiTitle  { font-family: var(--font-ui); font-size: 11px; color: var(--text-primary); flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
++.aoiCount  { font-family: var(--font-mono); font-size: 9px; color: var(--accent-dim); }
+ .expandIcon { font-size: 8px; color: var(--text-muted); }
+ 
++/* Aircraft rows */
+ .acList { background: var(--bg-base); }
+ .acRow {
+   display: flex; align-items: center; justify-content: space-between;
+   padding: 4px 16px; cursor: pointer;
+-  border-bottom: 1px solid rgba(30,45,61,0.5);
++  border-bottom: 1px solid rgba(30,45,61,0.4);
+   transition: background 0.1s;
+ }
+ .acRow:hover { background: var(--bg-hover); }
+ .acSelected { background: var(--accent-glow) !important; border-left: 2px solid var(--accent); }
+-.acCall   { font-family: var(--font-mono); font-size: 10px; color: var(--text-primary); }
++.acCall  { font-family: var(--font-mono); font-size: 10px; color: var(--text-primary); }
++.acMeta  { display: flex; align-items: center; gap: 5px; }
+ .acDetail { font-family: var(--font-mono); font-size: 9px; color: var(--text-muted); }
++.trailDot { font-size: 9px; color: var(--accent-dim); }
+ 
+-.detail {
+-  border-top: 1px solid var(--border);
+-  background: var(--bg-panel2);
+-}
++/* Detail panel */
++.detail { border-top: 1px solid var(--border); background: var(--bg-panel2); }
+ .detailHeader {
+   display: flex; align-items: center; justify-content: space-between;
+-  padding: 6px 10px; border-bottom: 1px solid var(--border);
++  padding: 5px 10px; border-bottom: 1px solid var(--border);
+ }
+-.detailCall { font-family: var(--font-mono); font-size: 12px; color: var(--accent); letter-spacing: 1px; }
++.detailCall  { font-family: var(--font-mono); font-size: 12px; color: var(--accent); letter-spacing: 1px; }
+ .detailClose { background: transparent; border: none; color: var(--text-muted); cursor: pointer; font-size: 10px; }
+ .detailClose:hover { color: var(--red); }
+ 
+ .detailGrid {
+   display: grid;
+   grid-template-columns: 64px 1fr;
+-  gap: 0;
+   padding: 4px 0;
+ }
+-.dk {
+-  font-family: var(--font-mono); font-size: 9px; letter-spacing: 1px;
+-  color: var(--text-muted); padding: 3px 10px;
+-}
+-.dv {
+-  font-family: var(--font-mono); font-size: 10px;
+-  color: var(--text-secondary); padding: 3px 6px;
+-}
++.dk { font-family: var(--font-mono); font-size: 9px; letter-spacing: 1px; color: var(--text-muted); padding: 3px 10px; }
++.dv { font-family: var(--font-mono); font-size: 10px; color: var(--text-secondary); padding: 3px 6px; }
+-- 
+2.43.0
+
