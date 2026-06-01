@@ -3,11 +3,13 @@
 
 const AIR_SOURCE       = 'src-air'
 const AIR_TRAIL_SOURCE = 'src-air-trail'
+const AIR_SEL_SOURCE   = 'src-air-selected'
 const AIR_LAYER_BASE   = 'air-base'
 const AIR_LAYER_LABEL  = 'air-label'
 const AIR_TRAIL_LAYER  = 'air-trail'
+const AIR_SEL_LAYER    = 'air-selected-highlight'
 
-export const AIR_CLICKABLE_LAYERS = [AIR_LAYER_BASE]
+export const AIR_CLICKABLE_LAYERS = [AIR_LAYER_BASE, AIR_LAYER_LABEL]
 
 export function ensureAirLayers(map) {
   if (map.getSource(AIR_SOURCE)) return  // already added
@@ -20,6 +22,12 @@ export function ensureAirLayers(map) {
 
   // ── Trail source ───────────────────────────────────────────────────────────
   map.addSource(AIR_TRAIL_SOURCE, {
+    type: 'geojson',
+    data: { type: 'FeatureCollection', features: [] },
+  })
+
+  // ── Selection highlight source (single point for the selected aircraft) ─────
+  map.addSource(AIR_SEL_SOURCE, {
     type: 'geojson',
     data: { type: 'FeatureCollection', features: [] },
   })
@@ -41,23 +49,12 @@ export function ensureAirLayers(map) {
         ['<', ['coalesce', ['get', 'alt_m'], 0], 9000], 'rgba(0,229,255,0.4)',
         'rgba(220,235,255,0.35)',
       ],
-      'line-width': [
-        'case',
-        ['==', ['get', 'selected'], 1], 3,
-        1.5,
-      ],
-      'line-opacity': [
-        'case',
-        ['==', ['get', 'selected'], 1], 0.9,
-        ['has', 'selected'], 0.06,
-        0.7,
-      ],
+      'line-width':   1.5,
+      'line-opacity': 0.7,
     },
   })
 
-  // Aircraft dots — altitude-coded color; near-AOI emphasis via near_aoi property;
-  // selected aircraft gets a bigger radius, bright stroke, and full opacity while
-  // non-selected aircraft fade when a selection exists.
+  // Aircraft dots — altitude-coded color; near-AOI emphasis via near_aoi property.
   map.addLayer({
     id:     AIR_LAYER_BASE,
     type:   'circle',
@@ -66,8 +63,6 @@ export function ensureAirLayers(map) {
     paint: {
       'circle-radius': [
         'case',
-        ['==', ['get', 'selected'], 1],
-        ['interpolate', ['linear'], ['zoom'], 2, 8, 5, 11, 8, 16, 12, 22],
         ['==', ['get', 'near_aoi'], 1],
         ['interpolate', ['linear'], ['zoom'], 2, 3.5, 5, 5, 8, 7.5, 12, 10],
         ['interpolate', ['linear'], ['zoom'], 2, 2, 5, 3.5, 8, 5.5, 12, 7],
@@ -78,21 +73,14 @@ export function ensureAirLayers(map) {
         ['<', ['coalesce', ['get', 'alt_m'], 0], 9000], '#00e5ff',
         '#e8f0ff',
       ],
-      'circle-opacity': [
-        'case',
-        ['==', ['get', 'selected'], 1], 1.0,
-        ['has', 'selected'], 0.35,
-        0.88,
-      ],
+      'circle-opacity':      0.88,
       'circle-stroke-color': [
         'case',
-        ['==', ['get', 'selected'], 1], '#ffffff',
         ['==', ['get', 'near_aoi'], 1], '#ffcc00',
         'rgba(8,12,16,0.65)',
       ],
       'circle-stroke-width': [
         'case',
-        ['==', ['get', 'selected'], 1], 4,
         ['==', ['get', 'near_aoi'], 1], 2.5,
         0.8,
       ],
@@ -121,25 +109,40 @@ export function ensureAirLayers(map) {
       'text-halo-width':  1.5,
     },
   })
+
+  // Selection highlight — large glowing dot on top of everything
+  map.addLayer({
+    id:     AIR_SEL_LAYER,
+    type:   'circle',
+    source: AIR_SEL_SOURCE,
+    layout: { visibility: 'none' },
+    paint: {
+      'circle-radius':        ['interpolate', ['linear'], ['zoom'], 2, 10, 5, 14, 8, 20, 12, 28],
+      'circle-color':         '#ffffff',
+      'circle-opacity':       0.25,
+      'circle-stroke-color':  '#ffffff',
+      'circle-stroke-width':  4,
+    },
+  })
 }
 
 export function removeAirLayers(map) {
-  [AIR_LAYER_LABEL, AIR_LAYER_BASE, AIR_TRAIL_LAYER].forEach((id) => {
+  [AIR_SEL_LAYER, AIR_LAYER_LABEL, AIR_LAYER_BASE, AIR_TRAIL_LAYER].forEach((id) => {
     if (map.getLayer(id)) map.removeLayer(id)
   })
-  ;[AIR_SOURCE, AIR_TRAIL_SOURCE].forEach((id) => {
+  ;[AIR_SEL_SOURCE, AIR_SOURCE, AIR_TRAIL_SOURCE].forEach((id) => {
     if (map.getSource(id)) map.removeSource(id)
   })
 }
 
-export function setAirData(map, aircraft, nearIcaos, selectedIcao) {
+export function setAirData(map, aircraft, nearIcaos) {
   const src = map.getSource(AIR_SOURCE)
   if (!src) return
   const nearSet = nearIcaos instanceof Set ? nearIcaos : new Set()
-  const hasSelected = selectedIcao != null
-  const features = (aircraft || []).map((ac) => {
-    const isSel = hasSelected && ac.icao24 === selectedIcao
-    const p = {
+  const features = (aircraft || []).map((ac) => ({
+    type:     'Feature',
+    geometry: { type: 'Point', coordinates: [ac.lng, ac.lat] },
+    properties: {
       icao24:   ac.icao24,
       callsign: ac.callsign || ac.icao24,
       alt_m:    ac.alt_m,
@@ -147,10 +150,8 @@ export function setAirData(map, aircraft, nearIcaos, selectedIcao) {
       heading:  ac.heading,
       country:  ac.country,
       near_aoi: nearSet.has(ac.icao24) ? 1 : 0,
-    }
-    if (hasSelected) p.selected = isSel ? 1 : 0
-    return { type: 'Feature', geometry: { type: 'Point', coordinates: [ac.lng, ac.lat] }, properties: p }
-  })
+    },
+  }))
   src.setData({ type: 'FeatureCollection', features })
 }
 
@@ -158,10 +159,8 @@ export function setAirData(map, aircraft, nearIcaos, selectedIcao) {
  * setAirTrails — render short history lines.
  * trails: { icao24: [[lng, lat], ...] } — ordered oldest→newest
  * aircraft: current aircraft array (for alt lookup for color coding)
- * selectedIcao: when set, marks the selected trail (selected=1) and others (selected=0)
- *   so paint expressions can strongly fade non-selected trails.
  */
-export function setAirTrails(map, trails, aircraft, selectedIcao) {
+export function setAirTrails(map, trails, aircraft) {
   const src = map.getSource(AIR_TRAIL_SOURCE)
   if (!src) return
 
@@ -169,16 +168,34 @@ export function setAirTrails(map, trails, aircraft, selectedIcao) {
   const altLookup = {}
   ;(aircraft || []).forEach((ac) => { altLookup[ac.icao24] = ac.alt_m })
 
-  const hasSelected = selectedIcao != null
   const features = Object.entries(trails || {})
     .filter(([, pts]) => pts && pts.length >= 2)
-    .map(([icao24, pts]) => {
-      const p = { icao24, alt_m: altLookup[icao24] ?? null }
-      if (hasSelected) p.selected = icao24 === selectedIcao ? 1 : 0
-      return { type: 'Feature', geometry: { type: 'LineString', coordinates: pts }, properties: p }
-    })
+    .map(([icao24, pts]) => ({
+      type:     'Feature',
+      geometry: { type: 'LineString', coordinates: pts },
+      properties: { icao24, alt_m: altLookup[icao24] ?? null },
+    }))
 
   src.setData({ type: 'FeatureCollection', features })
+}
+
+export function setSelectedHighlight(map, ac) {
+  const src = map.getSource(AIR_SEL_SOURCE)
+  if (!src) return
+  if (!ac || !ac.lat || !ac.lng) {
+    if (map.getLayer(AIR_SEL_LAYER)) map.setLayoutProperty(AIR_SEL_LAYER, 'visibility', 'none')
+    src.setData({ type: 'FeatureCollection', features: [] })
+    return
+  }
+  src.setData({
+    type: 'FeatureCollection',
+    features: [{
+      type: 'Feature',
+      geometry: { type: 'Point', coordinates: [ac.lng, ac.lat] },
+      properties: {},
+    }],
+  })
+  if (map.getLayer(AIR_SEL_LAYER)) map.setLayoutProperty(AIR_SEL_LAYER, 'visibility', 'visible')
 }
 
 export function setAirVisibility(map, visible) {
