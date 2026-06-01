@@ -57,8 +57,8 @@ export default function App() {
   const [selectedAoiId,     setSelectedAoiId]     = useState(null)
   const [drawMode,          setDrawMode]          = useState(null) // 'polygon'|'route'|'circle'|null
   const [alerts,            setAlerts]            = useState([])
-  // Stage 5 — Air traffic
-  const [airSnapshot,       setAirSnapshot]       = useState(null)    // {ts, count, aircraft}
+  // Stage 5 / 5.1 — Air traffic
+  const [airSnapshot,       setAirSnapshot]       = useState(null)    // {ts, count, aircraft, trails}
   const [airNearAois,       setAirNearAois]       = useState([])
   const [airVisible,        setAirVisible]        = useState(true)
   const [selectedAircraft,  setSelectedAircraft]  = useState(null)
@@ -246,16 +246,24 @@ export default function App() {
   }, []) // eslint-disable-line
 
 
-  // ── Stage 5: Air traffic ─────────────────────────────────────────────────────
-  const handleAirRefresh = useCallback(async () => {
+  // ── Stage 5 / 5.1: Air traffic ───────────────────────────────────────────────
+  const handleAirRefresh = useCallback(async (filters = {}) => {
     try {
-      const result = await refreshAirTraffic()
+      const result = await refreshAirTraffic(filters)
       if (result.ok) {
-        setAirSnapshot({ ts: result.ts, count: result.count, aircraft: result.aircraft })
-        // Immediately check near AOIs
+        // result now includes trails: {icao24: [[lng,lat],...]}
+        setAirSnapshot({
+          ts:       result.ts,
+          count:    result.count,
+          aircraft: result.aircraft,
+          trails:   result.trails || {},
+        })
+        // Immediately check near AOIs with improved geometry check
         const near = await fetchAirNearAois()
         if (near.ok) setAirNearAois(near.results || [])
-        if (result.count > 0) showToast(`${result.count} aircraft loaded`, 'info')
+        const filterNote = Object.values(filters).filter(Boolean).length
+          ? ' (filtered)' : ''
+        if (result.count > 0) showToast(`${result.count} aircraft loaded${filterNote}`, 'info')
       } else {
         showToast(`Air refresh failed: ${result.error}`, 'error')
       }
@@ -352,6 +360,7 @@ export default function App() {
             onAoiComplete={handleAoiComplete}
             onDrawCancel={() => setDrawMode(null)}
             aircraft={airSnapshot?.aircraft || []}
+            airTrails={airSnapshot?.trails || {}}
             airVisible={airVisible}
             onAircraftClick={handleAircraftClick}
           />

@@ -14,7 +14,7 @@ import {
   circleToPolygon, ringAreaMeters, formatArea, lineLengthMeters,
 } from '../hooks/aoiLayer.js'
 import {
-  ensureAirLayers, setAirData, setAirVisibility, AIR_CLICKABLE_LAYERS,
+  ensureAirLayers, setAirData, setAirTrails, setAirVisibility, AIR_CLICKABLE_LAYERS,
 } from '../hooks/airLayer.js'
 import styles from './MapView.module.css'
 
@@ -55,6 +55,7 @@ export default function MapView({
   onAoiComplete,        // (geometry, { kind, metric }) => void
   onDrawCancel,         // () => void
   aircraft,             // [] — Stage 5 air layer data
+  airTrails,            // {icao24: [[lng,lat],...]} — Stage 5.1 trail history
   airVisible,           // bool
   onAircraftClick,      // (props) => void
 }) {
@@ -86,8 +87,9 @@ export default function MapView({
   // Measure state (lives in refs to avoid re-render on every mousemove)
   const measureRef = useRef({ active: false, pointA: null, line: null, popup: null })
 
-  // Stage 5 — Air layer refs
+  // Stage 5 / 5.1 — Air layer refs
   const aircraftRef        = useRef(aircraft || [])
+  const airTrailsRef       = useRef(airTrails || {})
   const airVisibleRef      = useRef(airVisible ?? true)
   const onAircraftClickRef = useRef(onAircraftClick)
 
@@ -115,6 +117,7 @@ export default function MapView({
   measureActiveRef.current  = measureActive
   onMeasureResultRef.current = onMeasureResult
   aircraftRef.current        = aircraft || []
+  airTrailsRef.current       = airTrails || {}
   airVisibleRef.current      = airVisible ?? true
   onAircraftClickRef.current = onAircraftClick
 
@@ -381,9 +384,10 @@ export default function MapView({
 
       drawMarkers(map)
 
-      // Stage 5 — Air layer
+      // Stage 5 / 5.1 — Air layer
       ensureAirLayers(map)
       setAirData(map, aircraftRef.current)
+      setAirTrails(map, airTrailsRef.current, aircraftRef.current)
       if (!airVisibleRef.current) setAirVisibility(map, false)
       AIR_CLICKABLE_LAYERS.forEach((lid) => {
         map.on('click', lid, (e) => {
@@ -477,14 +481,18 @@ export default function MapView({
     else map.once('load', apply)
   }, [aois, selectedAoiId])
 
-  // ── Stage 5: aircraft data update ────────────────────────────────────────────
+  // ── Stage 5 / 5.1: aircraft data + trail update ───────────────────────────────
   useEffect(() => {
     const map = mapRef.current
     if (!map) return
-    const apply = () => { ensureAirLayers(map); setAirData(map, aircraft) }
+    const apply = () => {
+      ensureAirLayers(map)
+      setAirData(map, aircraft)
+      setAirTrails(map, airTrails, aircraft)
+    }
     if (map.isStyleLoaded()) apply()
     else map.once('load', apply)
-  }, [aircraft])
+  }, [aircraft, airTrails])
 
   // ── Stage 5: aircraft visibility toggle ──────────────────────────────────────
   useEffect(() => {
