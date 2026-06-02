@@ -202,6 +202,185 @@ def load_trails(conn, icao24_set: Optional[set] = None) -> dict:
     return trails
 
 
+# ── Aircraft classification helper ──────────────────────────────────────────────
+
+
+def classify_aircraft(ac: dict, metadata: dict) -> str:
+    """
+    Heuristic classification into one of:
+      military, government, cargo, business, rotor, civilian, unknown
+
+    Uses operator, owner, manufacturer, model, category (from metadata) and
+    callsign, country (from snapshot).  Degrades gracefully when metadata is empty.
+    Returns 'unknown' rather than guessing when confidence is low.
+    """
+    # Normalised text from every available field (metadata + snapshot)
+    fields = {
+        k: (metadata.get(k) or ac.get(k) or "").strip()
+        for k in ("operator", "owner", "manufacturer", "model", "category",
+                  "registration", "country")
+    }
+    callsign = (ac.get("callsign") or "").strip()
+    upper_cs = callsign.upper()
+    lower_cs = callsign.lower()
+
+    txt = " ".join(v.lower() for v in fields.values() if v)
+
+    # ── MILITARY (checked first, highest priority) ──────────────────────────
+    op_lower = fields["operator"].lower()
+    own_lower = fields["owner"].lower()
+
+    # Operator / owner military keywords
+    mil_op = [
+        "air force", "airforce", "usaf", "raf", "luftwaffe",
+        "army", "navy", "military", "marine corps", "usmc",
+        "air national guard", "air mobility command",
+        "ministry of defence", "ministry of defense",
+        "united states air force", "united states army",
+        "united states navy", "royal air force", "royal navy",
+        "royal australian air force", "canadian armed forces",
+        "aeronautica militare", "armee de l'air",
+        "vojno", "vojvoda",
+        "usaf ", "usn ", "ang ",
+        "national guard", "coast guard",
+        "marine corps", "marines",
+    ]
+    for kw in mil_op:
+        if kw in op_lower or kw in own_lower:
+            return "military"
+
+    # Military callsign prefixes (used by air mobility command, tankers, etc.)
+    if upper_cs.startswith(("RCH", "BMS", "MCC", "GAF", "AMC", "NAF",
+                            "DUKE", "SABER", "HKY", "REACH", "STING",
+                            "VIPR", "RAZR", "SNAKE", "DEMON",
+                            "USAF", "USN", "USMC", "ARMY")):
+        return "military"
+
+    # Military registration markers
+    reg = fields["registration"].upper()
+    if any(x in reg for x in ("USAF", "US ARMY", "US NAVY", "USMC", "FAB", "FAP")):
+        return "military"
+
+    # Known state-operated military fleets via country (conservative)
+    # Only applies when operator/owner are empty (so civilian airlines don't match)
+    if not op_lower and not own_lower:
+        c = fields["country"].upper()
+        # USA has many civilian aircraft; don't auto-classify all US as military
+        # Only very specific countries with mostly state-run military aviation
+        if c in ("KP", "PRK"):  # North Korea — almost all state military
+            return "military"
+
+    # ── GOVERNMENT ──────────────────────────────────────────────────────────
+    gov_op = [
+        "government", "state", "public", "police", "customs", "border",
+        "secret service", "fbi", "cia", "dea", "nsa",
+        "department of", "federal", "administration",
+        "search and rescue",
+        "kingdom of", "ministry of",
+    ]
+    for kw in gov_op:
+        if kw in op_lower or kw in own_lower:
+            return "government"
+    if "coast guard" in txt:
+        return "military"
+
+    # ── CARGO ───────────────────────────────────────────────────────────────
+    cargo_op = [
+        "cargo", "freight", "logistics", "express",
+        "ups", "fedex", "dhl", "tnt",
+    ]
+    for kw in cargo_op:
+        if kw in op_lower or kw in own_lower:
+            return "cargo"
+    cat = fields["category"].lower()
+    if cat in ("cargo", "freight", "freighter", "transport"):
+        return "cargo"
+
+    # ── ROTOR ───────────────────────────────────────────────────────────────
+    mfr = fields["manufacturer"].lower()
+    mdl = fields["model"].lower()
+    mfr_rotor = [
+        "airbus helicopter", "boeing helicopter", "bell helicopter",
+        "robinson", "md helicopter", "mdh",
+        "enstrom", "agusta", "westland", "kamov", "mil ",
+        "eurocopter",  "bell ",
+        "sikorsky",  "helicopter",
+    ]
+    mdl_rotor = [
+        "bell ", "robinson r", "sikorsky", "eurocopter", "airbus h",
+        "md ", "boeing ch-", "boeing ah-", "boeing v-",
+        "ch-", "ah-", "uh-", "mh-", "sh-", "ka-", "mi-",
+        "ec ", "bo 105", "bk 117",
+        "aw109", "aw119", "aw139", "aw169", "aw189",
+        "r22", "r44", "r66", "s-76", "s-92", "s-70", "s-61",
+    ]
+    for kw in mfr_rotor:
+        if kw in mfr:
+            return "rotor"
+    for kw in mdl_rotor:
+        if kw in mdl:
+            return "rotor"
+    if cat in ("helicopter", "rotorcraft", "rotary", "heli", "rotor"):
+        return "rotor"
+
+    # ── BUSINESS / PRIVATE JET ──────────────────────────────────────────────
+    mfr_biz = [
+        "gulfstream", "bombardier", "dassault", "cessna",
+        "learjet", "embraer", "hawker", "beechcraft",
+        "pilatus", "honda jet", "cirrus", "piper", "mooney",
+    ]
+    mdl_biz = [
+        "gulfstream", "challenger", "global express", "falcon", "learjet",
+        "citation", "phenom", "legacy", "praetor", "hawker",
+        "king air", "super king", "beachjet", "premier",
+        "astra", "westwind", "galaxy",
+        "g450", "g500", "g550", "g600", "g650", "g700",
+        "cl30", "cl35", "cl60", "cl85", "bd-100", "bd-700",
+        "eclipse 500", "eclipse 550",
+    ]
+    for kw in mfr_biz:
+        if kw in mfr:
+            return "business"
+    for kw in mdl_biz:
+        if kw in mdl:
+            return "business"
+    if cat in ("business jet", "business", "corporate", "executive", "bizjet", "bizliners"):
+        return "business"
+
+    # ── CIVILIAN (positive evidence only) ───────────────────────────────────
+    civ_op = [
+        "airlines", "airways", "airline", "aviation",
+        "commercial", "air taxi", "air transport",
+    ]
+    for kw in civ_op:
+        if kw in op_lower or kw in own_lower:
+            return "civilian"
+    civ_cat = {
+        "passenger", "airliner", "commuter", "regional",
+        "civilian", "light", "small", "medium", "utility",
+        "sport", "glider", "ultralight", "trainer",
+    }
+    if cat in civ_cat:
+        return "civilian"
+
+    return "unknown"
+
+
+def load_metadata_batch(conn, icao_set: set) -> dict:
+    """
+    Batch-load aircraft_metadata rows for a set of ICAO24 codes.
+    Returns {icao24: {...metadata_dict...}}.
+    """
+    if not icao_set:
+        return {}
+    placeholders = ",".join("?" * len(icao_set))
+    rows = conn.execute(
+        f"SELECT * FROM aircraft_metadata WHERE icao24 IN ({placeholders})",
+        list(icao_set),
+    ).fetchall()
+    return {r["icao24"]: dict(r) for r in rows}
+
+
 # ── Geometry helpers ───────────────────────────────────────────────────────────
 
 def _haversine_km(lat1: float, lng1: float, lat2: float, lng2: float) -> float:

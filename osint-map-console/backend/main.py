@@ -758,6 +758,13 @@ from air_traffic import (
     store_snapshot, load_latest_snapshot,
     upsert_trails, load_trails,
     intersect_with_aoi,
+    classify_aircraft, load_metadata_batch,
+)
+from enrichment import ensure_table as ensure_enrichment_table, batch_load as batch_load_enrichment, merge_into_metadata
+from orbital_data import (
+    fetch_orbital_data,
+    store_orbit_snapshot, load_latest_orbit_snapshot,
+    store_orbit_tracks, load_orbital_tracks,
 )
 
 
@@ -783,6 +790,8 @@ def _init_air_db(conn):
         )
     """)
     conn.execute("CREATE INDEX IF NOT EXISTS idx_air_trail_icao24 ON air_trail (icao24, ts)")
+    # Stage 5.2 Patch — enrichment cache for aircraft identity
+    ensure_enrichment_table(conn)
     # Stage 5.2 — optional aircraft metadata (populated via metadata_importer.py)
     conn.execute("""
         CREATE TABLE IF NOT EXISTS aircraft_metadata (
@@ -798,9 +807,48 @@ def _init_air_db(conn):
     conn.commit()
 
 
-# Init air tables alongside markers
+# ── Stage 6 — Orbital tables ────────────────────────────────────────────────
+
+def _init_orbit_db(conn):
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS orbit_snapshot (
+            id            INTEGER PRIMARY KEY AUTOINCREMENT,
+            fetched_at    INTEGER NOT NULL,
+            object_count  INTEGER NOT NULL DEFAULT 0,
+            payload       TEXT NOT NULL DEFAULT '[]'
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS orbit_track (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            sat_id      TEXT NOT NULL,
+            ts          INTEGER NOT NULL,
+            lat         REAL NOT NULL,
+            lng         REAL NOT NULL,
+            altitude_km REAL
+        )
+    """)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_orbit_track_sat_id ON orbit_track (sat_id, ts)")
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS orbit_metadata (
+            sat_id          TEXT PRIMARY KEY,
+            name            TEXT DEFAULT '',
+            norad_id        TEXT DEFAULT '',
+            intl_designator TEXT DEFAULT '',
+            object_type     TEXT DEFAULT '',
+            operator_name   TEXT DEFAULT '',
+            country         TEXT DEFAULT '',
+            category        TEXT DEFAULT '',
+            purpose         TEXT DEFAULT ''
+        )
+    """)
+    conn.commit()
+
+
+# Init air + orbit tables alongside markers
 _db_conn_for_init = get_db()
 _init_air_db(_db_conn_for_init)
+_init_orbit_db(_db_conn_for_init)
 _db_conn_for_init.close()
 
 
@@ -828,6 +876,19 @@ def air_refresh(
     if result["ok"] and result["aircraft"]:
         store_snapshot(conn, result)
         upsert_trails(conn, result["aircraft"], result["ts"])
+
+    # Classify all aircraft in the response
+    if result["aircraft"]:
+        icao_set = {a["icao24"] for a in result["aircraft"] if a.get("icao24")}
+        meta_batch = load_metadata_batch(conn, icao_set)
+        enr_batch = batch_load_enrichment(conn, icao_set)
+        for a in result["aircraft"]:
+            meta = meta_batch.get(a["icao24"], {})
+            enr = enr_batch.get(a["icao24"], {})
+            merge_into_metadata(meta, enr)
+            a["_class"] = classify_aircraft(a, meta)
+            if enr:
+                a["_enrichment_source"] = enr.get("source", "opensky-csv")
 
     # Return trails for the aircraft we just fetched
     icao_set = {a["icao24"] for a in result["aircraft"]} if result["aircraft"] else set()
@@ -896,55 +957,26 @@ def air_latest(
                         needle in (a.get("country") or "").upper() or
                         a["icao24"] in meta_icaos]
 
-    # Category filter — supports quick group names and exact match
+    # Category filter — heuristic classification, applied via _class on each aircraft
+    # Pre-compute _class for ALL aircraft (also used for detail display later)
+    icao_set = {a["icao24"] for a in aircraft if a.get("icao24")}
+    meta_batch = load_metadata_batch(conn, icao_set)
+    enr_batch = batch_load_enrichment(conn, icao_set)
+    for a in aircraft:
+        meta = meta_batch.get(a["icao24"], {})
+        enr = enr_batch.get(a["icao24"], {})
+        merge_into_metadata(meta, enr)
+        a["_class"] = classify_aircraft(a, meta)
+        if enr:
+            a["_enrichment_source"] = enr.get("source", "opensky-csv")
+
     if category:
-        # Known category groups with their member categories (lowercase)
-        CATEGORY_GROUPS = {
-            "civilian": {"passenger", "airliner", "commuter", "regional",
-                         "civilian", "light", "small", "medium", "utility",
-                         "trainer", "sport", "glider", "ultralight"},
-            "cargo":    {"cargo", "freight", "freighter", "transport"},
-            "business": {"business jet", "business", "corporate",
-                         "executive", "bizjet", "jet", "bizliners"},
-            "rotor":    {"helicopter", "rotorcraft", "rotary",
-                         "gyrocopter", "heli", "multirotor"},
-            "unknown":  None,  # special: handled below
-        }
         group = category.strip().lower()
-        if group == "all":
-            pass  # no filter
-        elif group == "unknown":
-            # Unknown = not in metadata at all, or in metadata with empty/unknown category
-            known_icaos = set()
-            for row in conn.execute(
-                "SELECT icao24 FROM aircraft_metadata "
-                "WHERE category IS NOT NULL AND category != '' AND category != 'unknown'"
-            ).fetchall():
-                known_icaos.add(row["icao24"])
-            aircraft = [a for a in aircraft if a["icao24"] not in known_icaos]
-        elif group in CATEGORY_GROUPS:
-            members = CATEGORY_GROUPS[group]
-            cat_rows = conn.execute(
-                "SELECT icao24 FROM aircraft_metadata WHERE LOWER(category) IN ({})"
-                .format(",".join("?" * len(members))),
-                list(members)
-            ).fetchall()
-            cat_icaos = {r["icao24"] for r in cat_rows}
-            if cat_icaos:
-                aircraft = [a for a in aircraft if a["icao24"] in cat_icaos]
+        if group != "all":
+            if group == "unknown":
+                aircraft = [a for a in aircraft if a["_class"] == "unknown"]
             else:
-                aircraft = []
-        else:
-            # Fallback: exact match on the raw value
-            cat_rows = conn.execute(
-                "SELECT icao24 FROM aircraft_metadata WHERE LOWER(category) = ?",
-                (group,)
-            ).fetchall()
-            cat_icaos = {r["icao24"] for r in cat_rows}
-            if cat_icaos:
-                aircraft = [a for a in aircraft if a["icao24"] in cat_icaos]
-            else:
-                aircraft = []
+                aircraft = [a for a in aircraft if a["_class"] == group]
 
     # Near-AOI-only filter — reuse existing intersect_with_aoi
     if near_aoi_only:
@@ -1040,8 +1072,20 @@ def air_detail(icao24: str):
         "SELECT * FROM aircraft_metadata WHERE icao24 = ?", (icao,)
     ).fetchone()
     metadata = dict(meta_row) if meta_row else {}
+    enr_row = conn.execute(
+        "SELECT * FROM aircraft_enrichment_cache WHERE icao24 = ?", (icao,)
+    ).fetchone()
+    enrichment_data = dict(enr_row) if enr_row else {}
+    merge_into_metadata(metadata, enrichment_data)
     conn.close()
-    return {"ok": True, "aircraft": match, "metadata": metadata}
+    cls = classify_aircraft(match, metadata)
+    return {
+        "ok": True,
+        "aircraft": match,
+        "metadata": metadata,
+        "_class": cls,
+        "_enrichment_source": enrichment_data.get("source", "") if enrichment_data else "",
+    }
 
 
 @app.get("/api/air/trail/{icao24}")
@@ -1140,3 +1184,271 @@ def air_trails(icao24: Optional[str] = None):
             trails = {}
     conn.close()
     return {"ok": True, "trails": trails}
+
+
+# ── Stage 6 — Orbital overlay ─────────────────────────────────────────────────
+
+
+@app.post("/api/orbit/refresh")
+def orbit_refresh():
+    """
+    Fetch orbital object data, store snapshot + track points.
+    Returns objects list and track data.
+    """
+    result = fetch_orbital_data()
+
+    conn = get_db()
+    if result["ok"] and result["objects"]:
+        store_orbit_snapshot(conn, result)
+        store_orbit_tracks(conn, result["objects"], result["ts"])
+    conn.close()
+
+    return {
+        "ok":       result["ok"],
+        "error":    result.get("error"),
+        "ts":       result["ts"],
+        "count":    result["count"],
+        "objects":  result["objects"],
+    }
+
+
+@app.get("/api/orbit/latest")
+def orbit_latest(
+    search:        Optional[str]  = None,
+    category:      Optional[str]  = None,
+    near_aoi_only: Optional[bool] = None,
+    country:       Optional[str]  = None,
+    operator:      Optional[str]  = None,
+):
+    """
+    Return the latest orbital snapshot with optional filters applied.
+    No new fetch.
+    """
+    conn = get_db()
+    snapshot = load_latest_orbit_snapshot(conn)
+    if not snapshot:
+        conn.close()
+        return {"ok": False, "ts": None, "count": 0, "objects": [],
+                "message": "No snapshot yet — call POST /api/orbit/refresh first"}
+
+    objects = snapshot["objects"]
+
+    # Free-text search across sat_id, name, norad_id, operator, country, purpose
+    if search:
+        needle = search.upper().strip()
+        if needle:
+            meta_rows = conn.execute(
+                "SELECT sat_id FROM orbit_metadata WHERE "
+                "UPPER(name) LIKE ? OR UPPER(operator_name) LIKE ? OR "
+                "UPPER(country) LIKE ? OR UPPER(purpose) LIKE ?",
+                (f"%{needle}%",) * 4
+            ).fetchall()
+            meta_sats = {r["sat_id"] for r in meta_rows}
+            objects = [o for o in objects if
+                        needle in (o.get("sat_id") or "").upper() or
+                        needle in (o.get("name") or "").upper() or
+                        needle in (o.get("norad_id") or "").upper() or
+                        needle in (o.get("country") or "").upper() or
+                        needle in (o.get("operator_name") or "").upper() or
+                        o.get("sat_id") in meta_sats]
+
+    # Category filter — supports quick group names and exact match
+    if category:
+        ORBITAL_CATEGORY_GROUPS = {
+            "military":        {"military", "reconnaissance", "spy", "sigint", "early warning", "surveillance", "recon", "intelligence"},
+            "reconnaissance":  {"reconnaissance", "spy", "sigint", "early warning", "surveillance", "recon", "intelligence"},
+            "communications":  {"communication", "communications", "broadband", "data relay", "satellite phone", "telecom", "telecommunication"},
+            "navigation":      {"navigation", "positioning", "gnss", "gps", "glonass", "galileo", "beidou"},
+            "weather":         {"weather", "meteorological", "weather monitoring", "geostationary weather", "climate", "weather satellite"},
+            "science":         {"science", "astronomy", "space telescope", "research", "earth observation", "land monitoring", "land imaging", "imaging", "observation", "scientific", "space station", "habitation"},
+        }
+        group = category.strip().lower()
+        if group == "all":
+            pass
+        elif group == "unknown":
+            known_sats = set()
+            for row in conn.execute(
+                "SELECT sat_id FROM orbit_metadata WHERE "
+                "category IS NOT NULL AND category != '' AND category != 'unknown'"
+            ).fetchall():
+                known_sats.add(row["sat_id"])
+            objects = [o for o in objects if
+                        o.get("sat_id") not in known_sats and
+                        not (o.get("category") or "")]
+        elif group in ORBITAL_CATEGORY_GROUPS:
+            members = ORBITAL_CATEGORY_GROUPS[group]
+            objects = [o for o in objects if (o.get("category") or "").lower().strip() in members]
+        else:
+            objects = [o for o in objects if (o.get("category") or "").lower().strip() == group]
+
+    # Country exact match
+    if country:
+        needle = country.strip().lower()
+        objects = [o for o in objects if (o.get("country") or "").lower() == needle]
+
+    # Operator exact match
+    if operator:
+        needle = operator.strip().lower()
+        objects = [o for o in objects if (o.get("operator_name") or "").lower() == needle]
+
+    # Near-AOI-only filter
+    if near_aoi_only:
+        aoi_rows = conn.execute("SELECT * FROM aoi WHERE monitored = 1").fetchall()
+        if aoi_rows and objects:
+            aoi_list = []
+            for r in aoi_rows:
+                try:
+                    geom = json.loads(r["geometry"])
+                except Exception:
+                    continue
+                aoi_list.append({
+                    "id": r["id"], "title": r["title"],
+                    "monitored": bool(r["monitored"]), "geometry": geom,
+                })
+            near_results = intersect_with_aoi(objects, aoi_list, pad_km=30.0)
+            near_sats = set()
+            for nr in near_results:
+                for obj in nr.get("aircraft") or []:
+                    near_sats.add(obj.get("sat_id") or obj.get("icao24"))
+            objects = [o for o in objects if o.get("sat_id") in near_sats]
+
+    # Load tracks for filtered objects
+    sat_set = {o["sat_id"] for o in objects if o.get("sat_id")}
+    tracks = load_orbital_tracks(conn, sat_set) if sat_set else {}
+    conn.close()
+
+    return {
+        "ok":      True,
+        "ts":      snapshot["ts"],
+        "count":   len(objects),
+        "objects": objects,
+        "tracks":  tracks,
+    }
+
+
+@app.get("/api/orbit/detail/{sat_id}")
+def orbit_detail(sat_id: str):
+    """
+    Return a single orbital object from the latest snapshot + optional metadata.
+    404 if the sat_id is not found in the current snapshot.
+    """
+    sid = sat_id.upper().strip()
+    conn = get_db()
+
+    # Find in latest snapshot
+    snapshot = load_latest_orbit_snapshot(conn)
+    if not snapshot:
+        conn.close()
+        raise HTTPException(status_code=404, detail="No snapshot available")
+
+    match = None
+    for obj in snapshot["objects"]:
+        if obj.get("sat_id") == sid:
+            match = obj
+            break
+    if not match:
+        conn.close()
+        raise HTTPException(status_code=404, detail="Satellite not found in latest snapshot")
+
+    # Optional metadata
+    meta_row = conn.execute(
+        "SELECT * FROM orbit_metadata WHERE sat_id = ?", (sid,)
+    ).fetchone()
+    metadata = dict(meta_row) if meta_row else {}
+    conn.close()
+    return {"ok": True, "object": match, "metadata": metadata}
+
+
+@app.get("/api/orbit/near-aois")
+def orbit_near_aois(pad_km: float = 30.0):
+    """
+    Geometry-aware intersection of orbital objects with monitored AOIs.
+    """
+    conn = get_db()
+    snapshot = load_latest_orbit_snapshot(conn)
+    aoi_rows = conn.execute("SELECT * FROM aoi WHERE monitored = 1").fetchall()
+    conn.close()
+
+    if not snapshot:
+        return {"ok": False, "ts": None, "results": [],
+                "message": "No snapshot yet — call POST /api/orbit/refresh first"}
+
+    aoi_list = []
+    for r in aoi_rows:
+        try:
+            geom = json.loads(r["geometry"])
+        except Exception:
+            continue
+        aoi_list.append({
+            "id":        r["id"],
+            "title":     r["title"],
+            "monitored": bool(r["monitored"]),
+            "geometry":  geom,
+        })
+
+    results = intersect_with_aoi(snapshot["objects"], aoi_list, pad_km=pad_km)
+    return {"ok": True, "ts": snapshot["ts"], "results": results}
+
+
+@app.get("/api/orbit/search")
+def orbit_search(q: str = ""):
+    """
+    Free-text search across the latest orbital snapshot (sat_id, name, norad_id)
+    and orbit_metadata fields (name, operator_name, country, category, purpose).
+    Returns combined results for any match.
+    """
+    needle = q.strip()
+    if not needle:
+        return {"ok": True, "q": q, "count": 0, "results": []}
+
+    conn = get_db()
+    snapshot = load_latest_orbit_snapshot(conn)
+    needle_up = needle.upper()
+
+    matched = set()
+    if snapshot:
+        for obj in snapshot["objects"]:
+            if (needle_up in (obj.get("sat_id") or "").upper() or
+                needle_up in (obj.get("name") or "").upper() or
+                needle_up in (obj.get("norad_id") or "").upper()):
+                matched.add(obj["sat_id"])
+
+    # Also match against orbit_metadata
+    like = f"%{needle}%"
+    for row in conn.execute(
+        "SELECT sat_id FROM orbit_metadata WHERE "
+        "name LIKE ? OR operator_name LIKE ? OR country LIKE ? "
+        "OR category LIKE ? OR purpose LIKE ?",
+        (like,) * 5,
+    ).fetchall():
+        matched.add(row["sat_id"])
+
+    if not matched:
+        conn.close()
+        return {"ok": True, "q": q, "count": 0, "results": []}
+
+    # Build lookups
+    obj_lookup = {}
+    if snapshot:
+        for obj in snapshot["objects"]:
+            obj_lookup[obj["sat_id"]] = obj
+
+    meta_lookup = {}
+    placeholders = ",".join("?" * len(matched))
+    for row in conn.execute(
+        f"SELECT * FROM orbit_metadata WHERE sat_id IN ({placeholders})",
+        list(matched),
+    ).fetchall():
+        meta_lookup[row["sat_id"]] = dict(row)
+
+    conn.close()
+
+    results = []
+    for sid in sorted(matched):
+        results.append({
+            "sat_id":  sid,
+            "object":  obj_lookup.get(sid),
+            "metadata": meta_lookup.get(sid, {}),
+        })
+
+    return {"ok": True, "q": q, "count": len(results), "results": results}

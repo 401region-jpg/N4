@@ -174,3 +174,19 @@ export async function fetchAirTrails(icao24) {
 export async function fetchAirDetail(icao24) {
   return apiFetch(`/api/air/detail/${encodeURIComponent(icao24)}`)
 }
+
+// ── Stage 6 — Orbital overlay ────────────────────────────────────────────────
+
+export async function refreshOrbital() {
+  return apiFetch('/api/orbit/refresh', { method: 'POST' })
+}
+
+export async function fetchOrbitalLatest(params = {}) {
+  const qs = Object.keys(params).length ? '?' + new URLSearchParams(params).toString() : ''
+  return apiFetch(`/api/orbit/latest${qs}`)
+}
+
+export async function fetchOrbitalNearAois(padKm) {
+  const qs = padKm != null ? `?pad_km=${padKm}` : ''
+  return apiFetch(`/api/orbit/near-aois${qs}`)
+}

@@ -43,47 +43,30 @@ export function ensureAirLayers(map) {
       'line-join': 'round',
     },
     paint: {
-      'line-color': [
-        'case',
-        ['<', ['coalesce', ['get', 'alt_m'], 0], 3000], 'rgba(255,204,0,0.45)',
-        ['<', ['coalesce', ['get', 'alt_m'], 0], 9000], 'rgba(0,229,255,0.4)',
-        'rgba(220,235,255,0.35)',
-      ],
-      'line-width':   1.5,
-      'line-opacity': 0.7,
+      'line-color':  '#00e5ff',
+      'line-width':  2,
+      'line-opacity': 0.6,
     },
   })
 
   // Aircraft dots — altitude-coded color; near-AOI emphasis via near_aoi property.
+  // All paint values use simple literals to avoid expression evaluation issues.
   map.addLayer({
     id:     AIR_LAYER_BASE,
     type:   'circle',
     source: AIR_SOURCE,
     layout: { visibility: 'visible' },
     paint: {
-      'circle-radius': [
-        'case',
-        ['==', ['get', 'near_aoi'], 1],
-        ['interpolate', ['linear'], ['zoom'], 2, 3.5, 5, 5, 8, 7.5, 12, 10],
-        ['interpolate', ['linear'], ['zoom'], 2, 2, 5, 3.5, 8, 5.5, 12, 7],
-      ],
+      'circle-radius':         6,
       'circle-color': [
         'case',
         ['<', ['coalesce', ['get', 'alt_m'], 0], 3000], '#ffcc00',
         ['<', ['coalesce', ['get', 'alt_m'], 0], 9000], '#00e5ff',
         '#e8f0ff',
       ],
-      'circle-opacity':      0.88,
-      'circle-stroke-color': [
-        'case',
-        ['==', ['get', 'near_aoi'], 1], '#ffcc00',
-        'rgba(8,12,16,0.65)',
-      ],
-      'circle-stroke-width': [
-        'case',
-        ['==', ['get', 'near_aoi'], 1], 2.5,
-        0.8,
-      ],
+      'circle-opacity':        0.9,
+      'circle-stroke-color':   '#ffffff',
+      'circle-stroke-width':   1.5,
     },
   })
 

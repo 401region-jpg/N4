@@ -5,6 +5,7 @@ import TopBar from './components/TopBar.jsx'
 import MarkerPanel from './components/MarkerPanel.jsx'
 import AoiPanel from './components/AoiPanel.jsx'
 import AircraftPanel from './components/AircraftPanel.jsx'
+import OrbitalPanel from './components/OrbitalPanel.jsx'
 import MarkerModal from './components/MarkerModal.jsx'
 import Toast from './components/Toast.jsx'
 import {
@@ -13,6 +14,7 @@ import {
   fetchAois, createAoi, deleteAoi,
   setAoiMonitored, fetchAlerts, reviewAlert, triggerMonitoringCheck,
   refreshAirTraffic, fetchAirLatest, fetchAirNearAois,
+  fetchOrbitalLatest, refreshOrbital, fetchOrbitalNearAois,
 } from './hooks/useApi.js'
 import { DEFAULT_BASEMAP } from './hooks/basemaps.js'
 import styles from './styles/App.module.css'
@@ -65,8 +67,17 @@ export default function App() {
   // Stage 5.2 — Extra controls
   const DEFAULT_AIR_FILTERS = { altMin: '', altMax: '', speedMin: '', speedMax: '', callsign: '', search: '', category: '', nearAoiOnly: false }
   const [airFilters,        setAirFilters]         = useState(DEFAULT_AIR_FILTERS)
-  const [refreshInterval,   setRefreshInterval]    = useState('30000') // 'manual' | ms string
+  const [refreshInterval,   setRefreshInterval]    = useState('manual') // 'manual' | ms string
   const [showTrails,        setShowTrails]         = useState(true)
+  // Stage 6 — Orbital
+  const [orbitalData,         setOrbitalData]         = useState(null)
+  const [orbitalVisible,      setOrbitalVisible]      = useState(true)
+  const [selectedOrbital,     setSelectedOrbital]     = useState(null)
+  const [orbitalNearAois,     setOrbitalNearAois]     = useState([])
+  const [showOrbTrails,       setShowOrbTrails]       = useState(true)
+  const DEFAULT_ORBITAL_FILTERS = { search: '', category: '', nearAoiOnly: false, country: '', operator: '' }
+  const [orbitalFilters,      setOrbitalFilters]       = useState(DEFAULT_ORBITAL_FILTERS)
+  const [orbitalRefreshInterval, setOrbitalRefreshInterval] = useState('manual')
   const [toasts,            setToasts]             = useState([])
   const toastIdRef   = useRef(0)
   const searchTimerRef = useRef(null)
@@ -91,6 +102,7 @@ export default function App() {
         fetchMarkers().then(setMarkers).catch(() => showToast('Failed to load markers'))
         fetchAois().then(setAois).catch(() => showToast('Failed to load AOIs'))
         fetchAlerts().then(setAlerts).catch(() => showToast('Failed to load alerts'))
+        fetchOrbitalLatest().then((r) => { if (r?.ok) setOrbitalData(r) }).catch(() => {})
       } else {
         showToast('Backend offline — start uvicorn on port 8000')
       }
@@ -347,6 +359,87 @@ export default function App() {
     return set
   }, [airNearAois])
 
+
+  // ── Stage 6 Batch 4: Orbital refresh, filters, polling ───────────────────────
+  const handleOrbitalRefresh = useCallback(async (filters = {}, silent = false) => {
+    try {
+      const result = await refreshOrbital()
+      if (!result.ok) {
+        showToast(`Orbital refresh failed: ${result.error}`, 'error')
+        return
+      }
+
+      // Apply client-side filters via GET /api/orbit/latest
+      const clientFilters = {}
+      if (filters.search)          clientFilters.search        = filters.search
+      if (filters.category)        clientFilters.category      = filters.category
+      if (filters.country)         clientFilters.country       = filters.country
+      if (filters.operator)        clientFilters.operator      = filters.operator
+      if (filters.near_aoi_only)   clientFilters.near_aoi_only = 'true'
+
+      let orbData = result
+      if (Object.keys(clientFilters).length) {
+        const latestResult = await fetchOrbitalLatest(clientFilters)
+        if (latestResult.ok) orbData = latestResult
+      }
+
+      setOrbitalData({
+        ts:       orbData.ts,
+        count:    orbData.count,
+        objects:  orbData.objects,
+        tracks:   orbData.tracks || {},
+      })
+
+      const near = await fetchOrbitalNearAois()
+      if (near.ok) setOrbitalNearAois(near.results || [])
+
+      if (!silent && result.count > 0) {
+        showToast(`${result.count} orbital objects loaded`, 'info')
+      }
+    } catch (e) { showToast(e.message || 'Orbital refresh failed') }
+  }, [showToast])
+
+  const handleOrbitalClick = useCallback((obj) => {
+    setSelectedOrbital((prev) => prev?.sat_id === obj?.sat_id ? null : obj)
+  }, [])
+
+  const handleOrbitalFilterChange = useCallback((key, val) => {
+    setOrbitalFilters((prev) => ({ ...prev, [key]: val }))
+  }, [])
+
+  const handleClearOrbitalFilters = useCallback(() => {
+    setOrbitalFilters(DEFAULT_ORBITAL_FILTERS)
+  }, [])
+
+  // Orbital polling
+  const orbPollingRef = useRef(null)
+  const orbFiltersRef = useRef(orbitalFilters)
+  orbFiltersRef.current = orbitalFilters
+  useEffect(() => {
+    if (orbPollingRef.current) clearInterval(orbPollingRef.current)
+    if (orbitalRefreshInterval === 'manual') return
+    const ms = parseInt(orbitalRefreshInterval, 10)
+    if (isNaN(ms) || ms < 30000) return
+    orbPollingRef.current = setInterval(() => {
+      const f = orbFiltersRef.current
+      const parsed = {
+        search:        f.search   || undefined,
+        category:      f.category || undefined,
+        near_aoi_only: f.nearAoiOnly || undefined,
+        country:       f.country  || undefined,
+        operator:      f.operator || undefined,
+      }
+      handleOrbitalRefresh(parsed, true)
+    }, ms)
+    return () => { if (orbPollingRef.current) clearInterval(orbPollingRef.current) }
+  }, [orbitalRefreshInterval, handleOrbitalRefresh])
+
+  const nearOrbitalSatIds = useMemo(() => {
+    const set = new Set()
+    orbitalNearAois.forEach((r) => r.aircraft.forEach((a) => set.add(a.sat_id || a.icao24)))
+    return set
+  }, [orbitalNearAois])
+
   const selectedAoi = aois.find((a) => a.id === selectedAoiId) || null
 
   // ── Copy center coords ─────────────────────────────────────────────────────
@@ -413,6 +506,20 @@ export default function App() {
           onToggleTrails={() => setShowTrails((v) => !v)}
           refreshInterval={refreshInterval}
           onRefreshIntervalChange={setRefreshInterval}
+          orbitalVisible={orbitalVisible}
+          onToggleOrbital={() => setOrbitalVisible((v) => !v)}
+          orbitalSnapshot={orbitalData}
+          orbitalNearAois={orbitalNearAois}
+          onOrbitalRefresh={handleOrbitalRefresh}
+          selectedOrbital={selectedOrbital}
+          onOrbitalClick={handleOrbitalClick}
+          orbitalFilters={orbitalFilters}
+          onOrbitalFilterChange={handleOrbitalFilterChange}
+          onClearOrbitalFilters={handleClearOrbitalFilters}
+          showOrbTrails={showOrbTrails}
+          onToggleOrbTrails={() => setShowOrbTrails((v) => !v)}
+          orbitalRefreshInterval={orbitalRefreshInterval}
+          onOrbitalRefreshIntervalChange={setOrbitalRefreshInterval}
         />
 
         <div className={styles.mapContainer}>
@@ -446,6 +553,13 @@ export default function App() {
             showTrails={showTrails}
             selectedAircraft={selectedAircraft}
             onDeselectAircraft={() => setSelectedAircraft(null)}
+            orbital={orbitalData?.objects || []}
+            orbitalTracks={orbitalData?.tracks || {}}
+            orbitalVisible={orbitalVisible}
+            selectedOrbital={selectedOrbital}
+            onOrbitalClick={handleOrbitalClick}
+            onDeselectOrbital={() => setSelectedOrbital(null)}
+            showOrbTrails={showOrbTrails}
           />
         </div>
 
