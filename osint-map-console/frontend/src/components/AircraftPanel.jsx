@@ -177,15 +177,17 @@ export default function AircraftPanel({
                 checked={filters.nearAoiOnly} onChange={(e) => onFilterChange('nearAoiOnly', e.target.checked)} />
             </div>
           </div>
-          {/* Category quick-group buttons */}
+          {/* Category quick-group buttons — resolved via heuristic _class */}
           <div className={styles.catGroupRow}>
             {[
-              { key: '',    label: 'ALL' },
-              { key: 'civilian', label: 'CIVILIAN' },
-              { key: 'cargo',    label: 'CARGO' },
-              { key: 'business', label: 'BUSINESS' },
-              { key: 'rotor',    label: 'ROTOR' },
-              { key: 'unknown',  label: 'UNKNOWN' },
+              { key: '',          label: 'ALL' },
+              { key: 'military',  label: 'MILITARY' },
+              { key: 'government',label: 'GOVERNMENT' },
+              { key: 'civilian',  label: 'CIVILIAN' },
+              { key: 'cargo',     label: 'CARGO' },
+              { key: 'business',  label: 'BUSINESS' },
+              { key: 'rotor',     label: 'ROTOR' },
+              { key: 'unknown',   label: 'UNKNOWN' },
             ].map((g) => (
               <button key={g.key}
                 className={`${styles.catBtn} ${(filters.category || '') === g.key ? styles.catActive : ''}`}
@@ -302,6 +304,8 @@ export default function AircraftPanel({
             <div className={styles.detailGrid}>
               <span className={styles.dk}>ICAO24</span>   <span className={styles.dv}>{ac.icao24}</span>
               <span className={styles.dk}>CALLSIGN</span> <span className={styles.dv}>{ac.callsign || '—'}</span>
+              <span className={styles.dk}>CLASS</span>    <span className={styles.dv}>{ac._class || 'unknown'}</span>
+              <span className={styles.dk}>SOURCE</span>   <span className={styles.dv}>{ac._enrichment_source || (meta?.operator ? 'metadata' : 'none')}</span>
               <span className={styles.dk}>COUNTRY</span>  <span className={styles.dv}>{ac.country || '—'}</span>
               <span className={styles.dk}>REG</span>      <span className={styles.dv}>{meta?.registration || '—'}</span>
               <span className={styles.dk}>OPERATOR</span> <span className={styles.dv}>{meta?.operator || '—'}</span>

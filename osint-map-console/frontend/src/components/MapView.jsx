@@ -17,6 +17,10 @@ import {
   ensureAirLayers, setAirData, setAirTrails, setAirVisibility, setTrailVisibility,
   setSelectedHighlight, AIR_CLICKABLE_LAYERS,
 } from '../hooks/airLayer.js'
+import {
+  ensureOrbLayers, setOrbData, setOrbTrails, setOrbVisibility, setOrbTrailVisibility,
+  setOrbSelectedHighlight, ORB_CLICKABLE_LAYERS, removeOrbLayers,
+} from '../hooks/orbLayer.js'
 import styles from './MapView.module.css'
 
 const DEFAULT_CENTER = [0, 20]
@@ -63,6 +67,13 @@ export default function MapView({
   showTrails,           // bool — independent trail layer toggle
   selectedAircraft,     // object|null — currently selected aircraft for map emphasis
   onDeselectAircraft,   // () => void — called on empty map click when selection exists
+  orbital,              // [] — Stage 6 orbital objects
+  orbitalTracks,        // {} — {sat_id: [[lng,lat],...]}
+  orbitalVisible,       // bool
+  selectedOrbital,      // object|null
+  onOrbitalClick,       // (obj) => void
+  onDeselectOrbital,    // () => void
+  showOrbTrails,        // bool
 }) {
   const containerRef   = useRef(null)
   const gridCanvasRef  = useRef(null)
@@ -102,6 +113,15 @@ export default function MapView({
   const selectedAircraftRef    = useRef(selectedAircraft)
   const onDeselectAircraftRef  = useRef(onDeselectAircraft)
 
+  // Stage 6 — Orbital layer refs
+  const orbitalRef             = useRef(orbital || [])
+  const orbitalTracksRef       = useRef(orbitalTracks || {})
+  const orbitalVisibleRef      = useRef(orbitalVisible ?? true)
+  const selectedOrbitalRef     = useRef(selectedOrbital)
+  const onOrbitalClickRef      = useRef(onOrbitalClick)
+  const onDeselectOrbitalRef   = useRef(onDeselectOrbital)
+  const showOrbTrailsRef       = useRef(showOrbTrails ?? true)
+
   // Live refs
   const markersDataRef    = useRef(markers)
   const visibleRef        = useRef(markersVisible)
@@ -133,6 +153,13 @@ export default function MapView({
   nearAircraftIcaosRef.current = nearAircraftIcaos || new Set()
   selectedAircraftRef.current  = selectedAircraft
   onDeselectAircraftRef.current = onDeselectAircraft
+  orbitalRef.current             = orbital || []
+  orbitalTracksRef.current       = orbitalTracks || {}
+  orbitalVisibleRef.current      = orbitalVisible ?? true
+  selectedOrbitalRef.current     = selectedOrbital
+  onOrbitalClickRef.current      = onOrbitalClick
+  onDeselectOrbitalRef.current   = onDeselectOrbital
+  showOrbTrailsRef.current       = showOrbTrails ?? true
 
   // ── Marker helpers ────────────────────────────────────────────────────────
   function clearMarkers() {
@@ -355,14 +382,19 @@ export default function MapView({
       const aoiLayers = ['aoi-fill', 'aoi-line', 'aoi-point'].filter((l) => map.getLayer(l))
       if (aoiLayers.length && map.queryRenderedFeatures(e.point, { layers: aoiLayers }).length) return
 
-      // Don't drop a marker or deselect when clicking on an aircraft —
-      // the per-layer handler toggles selection.
+      // Don't drop a marker or deselect when clicking on an aircraft or
+      // orbital object — the per-layer handler toggles selection.
       const airClickable = AIR_CLICKABLE_LAYERS.filter((l) => map.getLayer(l))
       if (airClickable.length && map.queryRenderedFeatures(e.point, { layers: airClickable }).length) return
+      const orbClickable = ORB_CLICKABLE_LAYERS.filter((l) => map.getLayer(l))
+      if (orbClickable.length && map.queryRenderedFeatures(e.point, { layers: orbClickable }).length) return
 
-      // Empty background click: deselect aircraft if any is selected
+      // Empty background click: deselect aircraft and orbital if selected
       if (selectedAircraftRef.current && onDeselectAircraftRef.current) {
         onDeselectAircraftRef.current()
+      }
+      if (selectedOrbitalRef.current && onDeselectOrbitalRef.current) {
+        onDeselectOrbitalRef.current()
       }
 
       onMapClickRef.current({ lat, lng })
@@ -423,6 +455,26 @@ export default function MapView({
         map.on('mouseleave', lid, () => { map.getCanvas().style.cursor = '' })
       })
 
+      // Stage 6 — Orbital layer
+      ensureOrbLayers(map)
+      setOrbData(map, orbitalRef.current)
+      setOrbTrails(map, orbitalTracksRef.current, orbitalRef.current)
+      setOrbSelectedHighlight(map, selectedOrbitalRef.current)
+      if (!orbitalVisibleRef.current) setOrbVisibility(map, false)
+      if (!showOrbTrailsRef.current) setOrbTrailVisibility(map, false)
+      ORB_CLICKABLE_LAYERS.forEach((lid) => {
+        map.on('click', lid, (e) => {
+          const props = e.features?.[0]?.properties
+          if (props) {
+            // Enrich with full object from snapshot
+            const full = orbitalRef.current.find((o) => o.sat_id === props.sat_id)
+            onOrbitalClickRef.current?.(full || props)
+          }
+        })
+        map.on('mouseenter', lid, () => { map.getCanvas().style.cursor = 'pointer' })
+        map.on('mouseleave', lid, () => { map.getCanvas().style.cursor = '' })
+      })
+
       // Attach grid canvas
       if (gridCanvasRef.current) {
         gridCleanupRef.current = attachGridCanvas(
@@ -453,6 +505,7 @@ export default function MapView({
       if (gridCleanupRef.current) gridCleanupRef.current()
       clearMarkers()
       if (searchPinRef.current) searchPinRef.current.remove()
+      removeOrbLayers(map)
       const ms = measureRef.current
       if (ms.dotMarker) ms.dotMarker.remove()
       if (ms.popup) ms.popup.remove()
@@ -541,6 +594,42 @@ export default function MapView({
     if (!map || !map.isStyleLoaded()) return
     setTrailVisibility(map, showTrails ?? true)
   }, [showTrails])
+
+  // ── Stage 6: orbital data update ──────────────────────────────────────────
+  useEffect(() => {
+    const map = mapRef.current
+    if (!map) return
+    const apply = () => {
+      ensureOrbLayers(map)
+      setOrbData(map, orbital)
+      setOrbTrails(map, orbitalTracks, orbital)
+    }
+    if (map.isStyleLoaded()) apply()
+    else map.once('load', apply)
+  }, [orbital, orbitalTracks])
+
+  // ── Stage 6: orbital selection highlight overlay ──────────────────────────
+  useEffect(() => {
+    const map = mapRef.current
+    if (!map) return
+    const apply = () => setOrbSelectedHighlight(map, selectedOrbital)
+    if (map.isStyleLoaded()) apply()
+    else map.once('load', apply)
+  }, [selectedOrbital])
+
+  // ── Stage 6: orbital visibility toggle ────────────────────────────────────
+  useEffect(() => {
+    const map = mapRef.current
+    if (!map || !map.isStyleLoaded()) return
+    setOrbVisibility(map, orbitalVisible ?? true)
+  }, [orbitalVisible])
+
+  // ── Stage 6: orbital trail layer independent toggle ───────────────────────
+  useEffect(() => {
+    const map = mapRef.current
+    if (!map || !map.isStyleLoaded()) return
+    setOrbTrailVisibility(map, showOrbTrails ?? true)
+  }, [showOrbTrails])
 
   // ── Draw mode: cursor + cancel cleanup ──────────────────────────────────────
   useEffect(() => {
